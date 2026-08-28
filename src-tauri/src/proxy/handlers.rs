@@ -792,6 +792,13 @@ pub async fn handle_grokbuild_responses(
     .await
 }
 
+pub async fn handle_opencode_responses(
+    State(state): State<ProxyState>,
+    request: axum::extract::Request,
+) -> Result<axum::response::Response, ProxyError> {
+    handle_responses_for_app(state, request, AppType::OpenCode, "OpenCode", "opencode").await
+}
+
 async fn handle_responses_for_app(
     state: ProxyState,
     request: axum::extract::Request,

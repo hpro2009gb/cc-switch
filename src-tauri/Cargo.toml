@@ -17,6 +17,7 @@ doctest = false
 
 [features]
 default = []
+personal = []
 test-hooks = []
 
 [build-dependencies]

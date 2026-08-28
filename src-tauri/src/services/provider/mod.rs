@@ -3018,21 +3018,37 @@ impl ProviderService {
             return Self::switch_normal(state, app_type, id, &providers);
         }
 
-        if matches!(app_type, AppType::ClaudeDesktop) {
-            return Self::switch_normal(state, app_type, id, &providers);
-        }
-
         // Provider switches and takeover toggles both mutate live config and the
         // restore backup. Serialize them per app, then decide from the locked
         // current state so a just-started takeover cannot be overwritten by a
         // normal live write.
-        let _switch_guard = if app_type.supports_local_proxy() {
+        let _switch_guard = if app_type.supports_local_proxy()
+            || matches!(app_type, AppType::ClaudeDesktop | AppType::OpenCode)
+        {
             Some(futures::executor::block_on(
                 state.proxy_service.lock_switch_for_app(app_type.as_str()),
             ))
         } else {
             None
         };
+
+        if matches!(app_type, AppType::ClaudeDesktop) {
+            return Self::switch_normal(state, app_type, id, &providers);
+        }
+
+        if matches!(app_type, AppType::OpenCode)
+            && futures::executor::block_on(state.db.get_proxy_config_for_app("opencode"))
+                .map(|config| config.enabled)
+                .unwrap_or(false)
+        {
+            futures::executor::block_on(
+                state
+                    .proxy_service
+                    .hot_switch_provider_inner(app_type.as_str(), id),
+            )
+            .map_err(|error| AppError::Message(format!("OpenCode gateway 切换失败: {error}")))?;
+            return Ok(SwitchResult::default());
+        }
 
         // Backup or live placeholders mean the live file is owned by proxy
         // takeover, even if the proxy server is temporarily stopped or is in the

@@ -11,7 +11,7 @@ use std::str::FromStr;
 fn require_proxy_app(app_type: &str) -> Result<crate::app_config::AppType, String> {
     let app = crate::app_config::AppType::from_str(app_type)
         .map_err(|error| format!("无效的应用类型: {error}"))?;
-    if !app.supports_local_proxy() {
+    if !app.supports_failover() {
         return Err(format!("{} 不支持本地路由", app.as_str()));
     }
     Ok(app)
@@ -30,6 +30,7 @@ pub async fn start_proxy_server(
 pub async fn stop_proxy_server(state: tauri::State<'_, AppState>) -> Result<(), String> {
     let takeover = state.proxy_service.get_takeover_status().await?;
     if takeover.claude
+        || takeover.claude_desktop
         || takeover.codex
         || takeover.gemini
         || takeover.grokbuild

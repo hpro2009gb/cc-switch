@@ -3,7 +3,7 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import { codeInspectorPlugin } from "code-inspector-plugin";
 
-export default defineConfig(({ command }) => ({
+export default defineConfig(({ command, mode }) => ({
   root: "src",
   plugins: [
     command === "serve" &&
@@ -28,5 +28,9 @@ export default defineConfig(({ command }) => ({
   },
   clearScreen: false,
   envPrefix: ["VITE_", "TAURI_"],
+  define:
+    mode === "personal"
+      ? { "import.meta.env.VITE_PERSONAL_BUILD": JSON.stringify("true") }
+      : undefined,
 }));
 

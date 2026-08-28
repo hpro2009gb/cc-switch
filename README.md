@@ -1,3 +1,9 @@
+> **Unofficial Personal fork.** This repository is a modified CC Switch Personal build. It is **not** the official [farion1231/cc-switch](https://github.com/farion1231/cc-switch) project and does **not** use the official updater. Data is stored separately in `~/.cc-switch-personal`.
+>
+> **Bản fork Personal không chính thức.** Repo này là bản CC Switch Personal đã nâng cấp. Không phải dự án chính thức, không dùng kênh cập nhật official. Dữ liệu lưu riêng tại `~/.cc-switch-personal`.
+>
+> Build the Windows Personal installer with `pnpm build:personal`.
+
 <div align="center">
 
 # CC Switch

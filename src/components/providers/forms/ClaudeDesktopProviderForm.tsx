@@ -47,6 +47,7 @@ import {
   type ClaudeDesktopRoleId,
 } from "@/config/claudeDesktopProviderPresets";
 import {
+  fetchCodexOauthModels,
   fetchModelsForConfig,
   showFetchModelsError,
   type FetchedModel,
@@ -307,6 +308,10 @@ export function ClaudeDesktopProviderForm({
   );
   const [fetchedModels, setFetchedModels] = useState<FetchedModel[]>([]);
   const [isFetchingModels, setIsFetchingModels] = useState(false);
+  const [codexOauthModels, setCodexOauthModels] = useState<FetchedModel[]>([]);
+  const [isFetchingCodexOauthModels, setIsFetchingCodexOauthModels] =
+    useState(false);
+  const codexOauthModelsRequestRef = useRef(0);
   const { data: defaultRoutes = [] } = useQuery({
     queryKey: ["claudeDesktopDefaultRoutes"],
     queryFn: () => providersApi.getClaudeDesktopDefaultRoutes(),
@@ -343,8 +348,17 @@ export function ClaudeDesktopProviderForm({
   });
 
   useEffect(() => {
-    onSubmittingChange?.(form.formState.isSubmitting || isFetchingModels);
-  }, [form.formState.isSubmitting, isFetchingModels, onSubmittingChange]);
+    onSubmittingChange?.(
+      form.formState.isSubmitting ||
+        isFetchingModels ||
+        isFetchingCodexOauthModels,
+    );
+  }, [
+    form.formState.isSubmitting,
+    isFetchingCodexOauthModels,
+    isFetchingModels,
+    onSubmittingChange,
+  ]);
 
   const presetEntries = useMemo<PresetEntry[]>(
     () =>
@@ -392,6 +406,16 @@ export function ClaudeDesktopProviderForm({
   const needsModelMapping = effectiveMode === "proxy";
   const routes = needsModelMapping ? proxyRoutes : directRoutes;
   const setRoutes = needsModelMapping ? setProxyRoutes : setDirectRoutes;
+
+  const modelDropdownModels = usesManagedOAuth
+    ? activeProviderType === "codex_oauth"
+      ? codexOauthModels
+      : []
+    : fetchedModels;
+  const modelFetchLoading =
+    activeProviderType === "codex_oauth"
+      ? isFetchingCodexOauthModels
+      : isFetchingModels;
 
   // API Key 获取/邀请链接（与 Claude Code 表单同款，见 ClaudeFormFields）
   const apiKeyLinkCategory = activePreset?.category ?? initialData?.category;
@@ -560,6 +584,52 @@ export function ClaudeDesktopProviderForm({
       setIsFetchingModels(false);
     }
   };
+
+  const handleFetchCodexOauthModels = async () => {
+    if (!isCodexOauthAuthenticated) {
+      toast.error(
+        t("codexOauth.loginRequired", {
+          defaultValue: "请先登录 ChatGPT 账号",
+        }),
+      );
+      return;
+    }
+
+    const requestId = codexOauthModelsRequestRef.current + 1;
+    codexOauthModelsRequestRef.current = requestId;
+    setIsFetchingCodexOauthModels(true);
+
+    try {
+      const models = await fetchCodexOauthModels(selectedCodexAccountId);
+      if (codexOauthModelsRequestRef.current !== requestId) return;
+
+      setCodexOauthModels(models);
+      toast.success(
+        t("providerForm.fetchModelsSuccess", {
+          count: models.length,
+          defaultValue: `已获取 ${models.length} 个模型`,
+        }),
+      );
+    } catch (error) {
+      if (codexOauthModelsRequestRef.current !== requestId) return;
+      showFetchModelsError(error, t);
+    } finally {
+      if (codexOauthModelsRequestRef.current === requestId) {
+        setIsFetchingCodexOauthModels(false);
+      }
+    }
+  };
+
+  const handleModelFetch =
+    activeProviderType === "codex_oauth"
+      ? handleFetchCodexOauthModels
+      : handleFetchModels;
+
+  useEffect(() => {
+    codexOauthModelsRequestRef.current += 1;
+    setCodexOauthModels([]);
+    setIsFetchingCodexOauthModels(false);
+  }, [activeProviderType, isCodexOauthAuthenticated, selectedCodexAccountId]);
 
   const handleSubmit = async (values: ProviderFormData) => {
     if (!values.name.trim()) {
@@ -805,11 +875,11 @@ export function ClaudeDesktopProviderForm({
           type="button"
           variant="outline"
           size="sm"
-          onClick={handleFetchModels}
-          disabled={isFetchingModels}
+          onClick={handleModelFetch}
+          disabled={modelFetchLoading}
           className="h-7 gap-1"
         >
-          {isFetchingModels ? (
+          {modelFetchLoading ? (
             <Loader2 className="h-3.5 w-3.5 animate-spin" />
           ) : (
             <Download className="h-3.5 w-3.5" />
@@ -1026,16 +1096,17 @@ export function ClaudeDesktopProviderForm({
                             defaultValue: "模型映射",
                           })}
                         </Label>
-                        {!usesManagedOAuth && (
+                        {(!usesManagedOAuth ||
+                          activeProviderType === "codex_oauth") && (
                           <Button
                             type="button"
                             variant="outline"
                             size="sm"
-                            onClick={handleFetchModels}
-                            disabled={isFetchingModels}
+                            onClick={handleModelFetch}
+                            disabled={modelFetchLoading}
                             className="h-7 gap-1"
                           >
-                            {isFetchingModels ? (
+                            {modelFetchLoading ? (
                               <Loader2 className="h-3.5 w-3.5 animate-spin" />
                             ) : (
                               <Download className="h-3.5 w-3.5" />
@@ -1131,9 +1202,9 @@ export function ClaudeDesktopProviderForm({
                               placeholder={modelPlaceholder}
                               className="flex-1"
                             />
-                            {fetchedModels.length > 0 && (
+                            {modelDropdownModels.length > 0 && (
                               <ModelDropdown
-                                models={fetchedModels}
+                                models={modelDropdownModels}
                                 onSelect={(id) =>
                                   updateRoute(index, {
                                     model: id,
@@ -1213,9 +1284,9 @@ export function ClaudeDesktopProviderForm({
                               placeholder="claude-sonnet-4-6"
                               className="flex-1"
                             />
-                            {fetchedModels.length > 0 && (
+                            {modelDropdownModels.length > 0 && (
                               <ModelDropdown
-                                models={fetchedModels}
+                                models={modelDropdownModels}
                                 onSelect={(id) =>
                                   updateRoute(index, { route: id })
                                 }

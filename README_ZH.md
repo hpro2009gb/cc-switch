@@ -1,3 +1,7 @@
+> **非官方 Personal 分支。** 本仓库是修改后的 CC Switch Personal，**不是**官方 [farion1231/cc-switch](https://github.com/farion1231/cc-switch)，也不使用官方更新通道。数据单独保存在 `~/.cc-switch-personal`。
+>
+> 使用 `pnpm build:personal` 构建 Windows Personal 安装包。
+
 <div align="center">
 
 # CC Switch

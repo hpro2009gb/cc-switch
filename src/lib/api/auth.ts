@@ -71,6 +71,16 @@ export async function authGetStatus(
   });
 }
 
+export async function authImportChromeCookies(
+  authProvider: ManagedAuthProvider,
+  cookieHeader: string,
+): Promise<ManagedAuthAccount> {
+  return invoke<ManagedAuthAccount>("auth_import_chrome_cookies", {
+    authProvider,
+    cookieHeader,
+  });
+}
+
 export async function authRemoveAccount(
   authProvider: ManagedAuthProvider,
   accountId: string,
@@ -104,6 +114,7 @@ export const authApi = {
   authPollForAccount,
   authListAccounts,
   authGetStatus,
+  authImportChromeCookies,
   authRemoveAccount,
   authSetDefaultAccount,
   authLogout,

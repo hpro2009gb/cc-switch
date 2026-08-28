@@ -20,6 +20,7 @@ export interface ProviderProbeInput {
 export interface DetectedModel {
   id: string;
   ownedBy?: string | null;
+  displayName?: string | null;
 }
 
 export interface ProtocolCapability {
@@ -45,12 +46,15 @@ export interface ProviderInstallSelection {
   baseUrl: string;
   apiKey: string;
   model: string;
+  models?: DetectedModel[];
   claudeProtocol?: UpstreamProtocol;
   codexProtocol?: UpstreamProtocol;
+  claudeDesktopProtocol?: UpstreamProtocol;
+  opencodeProtocol?: UpstreamProtocol;
 }
 
 export interface AppInstallPreview {
-  app: "claude" | "codex";
+  app: "claude" | "codex" | "claude-desktop" | "opencode";
   providerId: string;
   protocol: UpstreamProtocol;
   mode: "direct" | "proxy";
@@ -67,15 +71,19 @@ export interface ProviderInstallPreview {
   urlMode: UrlMode;
   claude?: AppInstallPreview | null;
   codex?: AppInstallPreview | null;
+  claudeDesktop?: AppInstallPreview | null;
+  opencode?: AppInstallPreview | null;
   proxyWillStart: boolean;
   warnings: string[];
 }
 
 export interface ApplyProviderInstallResult {
-  appliedApps: Array<"claude" | "codex">;
+  appliedApps: Array<"claude" | "codex" | "claude-desktop" | "opencode">;
   rolledBack: boolean;
   rollbackErrors: string[];
-  restartRequiredApps: Array<"claude" | "codex">;
+  restartRequiredApps: Array<
+    "claude" | "codex" | "claude-desktop" | "opencode"
+  >;
 }
 
 export const providerWizardApi = {

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Loader2, ShieldCheck, WandSparkles } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -17,6 +17,7 @@ import type { AppId } from "@/lib/api";
 import {
   providerWizardApi,
   type ApplyProviderInstallResult,
+  type DetectedModel,
   type ProviderInstallPreview,
   type ProviderProbeResult,
   type UpstreamProtocol,
@@ -34,12 +35,24 @@ const PROTOCOL_LABELS: Record<UpstreamProtocol, string> = {
   open_ai_responses: "OpenAI Responses",
 };
 
+function modelLabel(model: DetectedModel): string {
+  const displayName = model.displayName?.trim();
+  if (
+    !displayName ||
+    displayName === model.id ||
+    displayName.includes(model.id)
+  ) {
+    return displayName || model.id;
+  }
+  return `${displayName} (${model.id})`;
+}
+
 function preferredProtocol(
   probe: ProviderProbeResult,
-  app: "claude" | "codex",
+  app: "claude" | "codex" | "claude-desktop" | "opencode",
 ): UpstreamProtocol | undefined {
   const preference: UpstreamProtocol[] =
-    app === "claude"
+    app === "claude" || app === "claude-desktop"
       ? ["anthropic_messages", "open_ai_responses", "open_ai_chat"]
       : ["open_ai_responses", "open_ai_chat", "anthropic_messages"];
   return preference.find((protocol) =>
@@ -63,16 +76,42 @@ export function ProviderSetupWizard({
   const [preview, setPreview] = useState<ProviderInstallPreview | null>(null);
   const [claudeSelected, setClaudeSelected] = useState(initialApp === "claude");
   const [codexSelected, setCodexSelected] = useState(initialApp === "codex");
+  const [claudeDesktopSelected, setClaudeDesktopSelected] = useState(
+    initialApp === "claude-desktop",
+  );
+  const [opencodeSelected, setOpencodeSelected] = useState(
+    initialApp === "opencode",
+  );
   const [claudeProtocol, setClaudeProtocol] = useState<
     UpstreamProtocol | undefined
   >();
   const [codexProtocol, setCodexProtocol] = useState<
     UpstreamProtocol | undefined
   >();
+  const [claudeDesktopProtocol, setClaudeDesktopProtocol] = useState<
+    UpstreamProtocol | undefined
+  >();
+  const [opencodeProtocol, setOpencodeProtocol] = useState<
+    UpstreamProtocol | undefined
+  >();
   const [busy, setBusy] = useState(false);
+  const probeRevision = useRef(0);
+
+  const invalidateConnectionProbe = () => {
+    probeRevision.current += 1;
+    setModel("");
+    setProbe(null);
+    setPreview(null);
+    setClaudeProtocol(undefined);
+    setCodexProtocol(undefined);
+    setClaudeDesktopProtocol(undefined);
+    setOpencodeProtocol(undefined);
+    setBusy(false);
+  };
 
   useEffect(() => {
     if (!open) {
+      probeRevision.current += 1;
       setName("");
       setBaseUrl("");
       setApiKey("");
@@ -81,8 +120,13 @@ export function ProviderSetupWizard({
       setPreview(null);
       setClaudeSelected(initialApp === "claude");
       setCodexSelected(initialApp === "codex");
+      setClaudeDesktopSelected(initialApp === "claude-desktop");
+      setOpencodeSelected(initialApp === "opencode");
       setClaudeProtocol(undefined);
       setCodexProtocol(undefined);
+      setClaudeDesktopProtocol(undefined);
+      setOpencodeProtocol(undefined);
+      setBusy(false);
     }
   }, [initialApp, open]);
 
@@ -91,6 +135,7 @@ export function ProviderSetupWizard({
       toast.error("Nhập tên, Base URL và API key trước khi kiểm tra.");
       return;
     }
+    const revision = ++probeRevision.current;
     setBusy(true);
     try {
       const result = await providerWizardApi.probe({
@@ -99,22 +144,58 @@ export function ProviderSetupWizard({
         model: model || undefined,
         allowInferenceProbe: true,
       });
+      if (revision !== probeRevision.current) return;
       setProbe(result);
       setModel(result.recommendedModel ?? model);
-      setClaudeProtocol(preferredProtocol(result, "claude"));
-      setCodexProtocol(preferredProtocol(result, "codex"));
+      const nextClaude = preferredProtocol(result, "claude");
+      const nextCodex = preferredProtocol(result, "codex");
+      const nextClaudeDesktop = preferredProtocol(result, "claude-desktop");
+      const nextOpenCode = preferredProtocol(result, "opencode");
+      setClaudeProtocol((current) => nextClaude ?? current);
+      setCodexProtocol((current) => nextCodex ?? current);
+      setClaudeDesktopProtocol((current) => nextClaudeDesktop ?? current);
+      setOpencodeProtocol((current) => nextOpenCode ?? current);
       setPreview(null);
-      toast.success("Đã kiểm tra protocol và model.");
+      if (result.capabilities.some((capability) => capability.supported)) {
+        toast.success("Đã kiểm tra protocol và model.");
+      } else {
+        toast.error(
+          "Không xác minh được protocol; xem trạng thái HTTP trong phần chẩn đoán.",
+        );
+      }
     } catch (error) {
-      toast.error(String(error));
+      if (revision === probeRevision.current) {
+        toast.error(String(error));
+      }
     } finally {
-      setBusy(false);
+      if (revision === probeRevision.current) {
+        setBusy(false);
+      }
     }
   };
 
   const buildPreview = async () => {
-    if (!probe || !model.trim() || (!claudeSelected && !codexSelected)) {
+    if (
+      !probe ||
+      !model.trim() ||
+      (!claudeSelected &&
+        !codexSelected &&
+        !claudeDesktopSelected &&
+        !opencodeSelected)
+    ) {
       toast.error("Chọn ứng dụng và model trước khi xem preview.");
+      return;
+    }
+    const missingProtocols = [
+      claudeSelected && !claudeProtocol ? "Claude Code" : null,
+      codexSelected && !codexProtocol ? "Codex" : null,
+      claudeDesktopSelected && !claudeDesktopProtocol ? "Claude Cowork" : null,
+      opencodeSelected && !opencodeProtocol ? "OpenCode" : null,
+    ].filter(Boolean);
+    if (missingProtocols.length > 0) {
+      toast.error(
+        `Chọn protocol cho ${missingProtocols.join(", ")} trước khi xem preview.`,
+      );
       return;
     }
     setBusy(true);
@@ -124,8 +205,13 @@ export function ProviderSetupWizard({
         baseUrl,
         apiKey,
         model,
+        models: probe.models,
         claudeProtocol: claudeSelected ? claudeProtocol : undefined,
         codexProtocol: codexSelected ? codexProtocol : undefined,
+        claudeDesktopProtocol: claudeDesktopSelected
+          ? claudeDesktopProtocol
+          : undefined,
+        opencodeProtocol: opencodeSelected ? opencodeProtocol : undefined,
       });
       setPreview(result);
     } catch (error) {
@@ -136,7 +222,7 @@ export function ProviderSetupWizard({
   };
 
   const apply = async () => {
-    if (!preview) return;
+    if (!preview || !probe) return;
     setBusy(true);
     try {
       const result: ApplyProviderInstallResult = await providerWizardApi.apply({
@@ -144,12 +230,21 @@ export function ProviderSetupWizard({
         baseUrl,
         apiKey,
         model,
+        models: probe.models,
         claudeProtocol: claudeSelected ? claudeProtocol : undefined,
         codexProtocol: codexSelected ? codexProtocol : undefined,
+        claudeDesktopProtocol: claudeDesktopSelected
+          ? claudeDesktopProtocol
+          : undefined,
+        opencodeProtocol: opencodeSelected ? opencodeProtocol : undefined,
       });
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["providers", "claude"] }),
         queryClient.invalidateQueries({ queryKey: ["providers", "codex"] }),
+        queryClient.invalidateQueries({
+          queryKey: ["providers", "claude-desktop"],
+        }),
+        queryClient.invalidateQueries({ queryKey: ["providers", "opencode"] }),
       ]);
       toast.success(
         `Đã cài ${result.appliedApps.length} ứng dụng. Hãy mở lại IDE nếu được yêu cầu.`,
@@ -162,12 +257,8 @@ export function ProviderSetupWizard({
     }
   };
 
-  const canPreview =
-    !!probe &&
-    !!model.trim() &&
-    (claudeSelected || codexSelected) &&
-    (!claudeSelected || !!claudeProtocol) &&
-    (!codexSelected || !!codexProtocol);
+  const selectedModelIsDetected =
+    probe?.models.some((item) => item.id === model) ?? false;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -188,7 +279,10 @@ export function ProviderSetupWizard({
             <Input
               id="wizard-provider-name"
               value={name}
-              onChange={(event) => setName(event.target.value)}
+              onChange={(event) => {
+                setName(event.target.value);
+                setPreview(null);
+              }}
               placeholder="Ví dụ: My Gateway"
             />
           </div>
@@ -197,7 +291,10 @@ export function ProviderSetupWizard({
             <Input
               id="wizard-base-url"
               value={baseUrl}
-              onChange={(event) => setBaseUrl(event.target.value)}
+              onChange={(event) => {
+                setBaseUrl(event.target.value);
+                invalidateConnectionProbe();
+              }}
               placeholder="https://provider.example/v1"
               type="url"
             />
@@ -207,7 +304,10 @@ export function ProviderSetupWizard({
             <Input
               id="wizard-api-key"
               value={apiKey}
-              onChange={(event) => setApiKey(event.target.value)}
+              onChange={(event) => {
+                setApiKey(event.target.value);
+                invalidateConnectionProbe();
+              }}
               placeholder="Key chỉ được giữ trong phiên thiết lập"
               type="password"
               autoComplete="off"
@@ -231,71 +331,150 @@ export function ProviderSetupWizard({
                 {probe.models.length} model được phát hiện tại{" "}
                 {probe.normalizedBaseUrl}
               </div>
+              {(probe.warnings.length > 0 ||
+                probe.capabilities.every(
+                  (capability) => !capability.supported,
+                )) && (
+                <div
+                  role="alert"
+                  className="rounded-md border border-amber-500/30 bg-amber-500/5 p-2 text-xs text-amber-700"
+                >
+                  {probe.warnings.map((warning) => (
+                    <p key={warning}>{warning}</p>
+                  ))}
+                  {probe.capabilities
+                    .filter((capability) => !capability.supported)
+                    .map((capability) => (
+                      <p key={capability.protocol}>
+                        {PROTOCOL_LABELS[capability.protocol]}:{" "}
+                        {capability.evidence.join("; ") || "không có phản hồi"}
+                      </p>
+                    ))}
+                </div>
+              )}
               <div className="grid gap-2 sm:grid-cols-2">
-                {(["claude", "codex"] as const).map((app) => {
-                  const selected =
-                    app === "claude" ? claudeSelected : codexSelected;
-                  const protocol =
-                    app === "claude" ? claudeProtocol : codexProtocol;
-                  const setSelected =
-                    app === "claude" ? setClaudeSelected : setCodexSelected;
-                  const setProtocol =
-                    app === "claude" ? setClaudeProtocol : setCodexProtocol;
+                {(
+                  ["claude", "codex", "claude-desktop", "opencode"] as const
+                ).map((app) => {
+                  const config = {
+                    claude: {
+                      label: "Claude Code",
+                      selected: claudeSelected,
+                      protocol: claudeProtocol,
+                      setSelected: setClaudeSelected,
+                      setProtocol: setClaudeProtocol,
+                    },
+                    codex: {
+                      label: "Codex",
+                      selected: codexSelected,
+                      protocol: codexProtocol,
+                      setSelected: setCodexSelected,
+                      setProtocol: setCodexProtocol,
+                    },
+                    "claude-desktop": {
+                      label: "Claude Cowork",
+                      selected: claudeDesktopSelected,
+                      protocol: claudeDesktopProtocol,
+                      setSelected: setClaudeDesktopSelected,
+                      setProtocol: setClaudeDesktopProtocol,
+                    },
+                    opencode: {
+                      label: "OpenCode",
+                      selected: opencodeSelected,
+                      protocol: opencodeProtocol,
+                      setSelected: setOpencodeSelected,
+                      setProtocol: setOpencodeProtocol,
+                    },
+                  }[app];
                   return (
                     <div key={app} className="grid gap-2 rounded-md border p-3">
                       <label className="flex items-center gap-2 text-sm font-medium">
                         <input
                           type="checkbox"
-                          checked={selected}
-                          onChange={(event) =>
-                            setSelected(event.target.checked)
-                          }
+                          checked={config.selected}
+                          onChange={(event) => {
+                            config.setSelected(event.target.checked);
+                            setPreview(null);
+                          }}
                         />
-                        {app === "claude" ? "Claude Code" : "Codex"}
+                        {config.label}
                       </label>
                       <select
+                        aria-label={`Protocol ${config.label}`}
                         className="h-9 rounded-md border bg-background px-2 text-sm"
-                        value={protocol ?? ""}
-                        disabled={!selected}
-                        onChange={(event) =>
-                          setProtocol(
+                        value={config.protocol ?? ""}
+                        disabled={!config.selected}
+                        onChange={(event) => {
+                          config.setProtocol(
                             (event.target.value || undefined) as
                               | UpstreamProtocol
                               | undefined,
-                          )
-                        }
+                          );
+                          setPreview(null);
+                        }}
                       >
                         <option value="">Chọn protocol</option>
-                        {probe.capabilities
-                          .filter((capability) => capability.supported)
-                          .map((capability) => (
-                            <option
-                              key={capability.protocol}
-                              value={capability.protocol}
-                            >
-                              {PROTOCOL_LABELS[capability.protocol]}
-                            </option>
-                          ))}
+                        {probe.capabilities.map((capability) => (
+                          <option
+                            key={capability.protocol}
+                            value={capability.protocol}
+                          >
+                            {PROTOCOL_LABELS[capability.protocol]}
+                            {capability.supported ? "" : " (chưa xác minh)"}
+                          </option>
+                        ))}
                       </select>
+                      {config.selected && !config.protocol && (
+                        <p className="text-xs text-amber-600">
+                          Probe chưa xác nhận được protocol bằng model thử
+                          nghiệm. Bạn có thể chọn protocol phù hợp để tiếp tục
+                          hoặc chọn model khác rồi kiểm tra kết nối lại.
+                        </p>
+                      )}
                     </div>
                   );
                 })}
               </div>
               <div className="grid gap-2">
-                <Label htmlFor="wizard-model">Model sử dụng</Label>
-                <Input
+                <Label htmlFor="wizard-model">Model mặc định</Label>
+                <select
                   id="wizard-model"
-                  value={model}
-                  onChange={(event) => setModel(event.target.value)}
-                  list="wizard-model-list"
-                />
-                <datalist id="wizard-model-list">
+                  className="h-9 rounded-md border bg-background px-2 text-sm"
+                  value={selectedModelIsDetected ? model : "__custom__"}
+                  onChange={(event) => {
+                    setModel(
+                      event.target.value === "__custom__"
+                        ? ""
+                        : event.target.value,
+                    );
+                    setPreview(null);
+                  }}
+                >
                   {probe.models.map((item) => (
-                    <option key={item.id} value={item.id} />
+                    <option key={item.id} value={item.id}>
+                      {modelLabel(item)}
+                    </option>
                   ))}
-                </datalist>
+                  <option value="__custom__">Tự nhập model khác...</option>
+                </select>
+                {!selectedModelIsDetected && (
+                  <Input
+                    aria-label="Model tùy chỉnh"
+                    value={model}
+                    onChange={(event) => {
+                      setModel(event.target.value);
+                      setPreview(null);
+                    }}
+                    placeholder="Nhập chính xác model ID upstream"
+                  />
+                )}
+                <p className="text-xs text-muted-foreground">
+                  Toàn bộ {probe.models.length} model được giữ trong catalog của
+                  Codex, Claude Cowork và OpenCode. Tên trong ngoặc là model ID
+                  thực sự gửi lên provider.
+                </p>
               </div>
-              <Button onClick={buildPreview} disabled={busy || !canPreview}>
+              <Button onClick={buildPreview} disabled={busy}>
                 Xem preview cấu hình
               </Button>
             </div>
@@ -304,16 +483,31 @@ export function ProviderSetupWizard({
           {preview && (
             <div className="grid gap-2 rounded-lg border border-primary/30 bg-primary/5 p-3 text-sm">
               <strong>Preview</strong>
-              {[preview.claude, preview.codex].filter(Boolean).map((item) => (
-                <div key={item!.app}>
-                  <b>{item!.app === "claude" ? "Claude Code" : "Codex"}</b>:{" "}
-                  {item!.mode}, {PROTOCOL_LABELS[item!.protocol]}, model `
-                  {item!.model}`
-                  <div className="text-muted-foreground">
-                    {item!.filesToChange.join(", ")}
+              {[
+                preview.claude,
+                preview.codex,
+                preview.claudeDesktop,
+                preview.opencode,
+              ]
+                .filter(Boolean)
+                .map((item) => (
+                  <div key={item!.app}>
+                    <b>
+                      {item!.app === "claude"
+                        ? "Claude Code"
+                        : item!.app === "codex"
+                          ? "Codex"
+                          : item!.app === "claude-desktop"
+                            ? "Claude Cowork"
+                            : "OpenCode"}
+                    </b>
+                    : {item!.mode}, {PROTOCOL_LABELS[item!.protocol]}, model `
+                    {item!.model}`
+                    <div className="text-muted-foreground">
+                      {item!.filesToChange.join(", ")}
+                    </div>
                   </div>
-                </div>
-              ))}
+                ))}
               {preview.proxyWillStart && (
                 <div className="text-amber-600">
                   Một ứng dụng cần local routing. Apply sẽ bật takeover sau khi

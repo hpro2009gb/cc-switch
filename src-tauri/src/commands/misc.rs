@@ -53,15 +53,24 @@ pub async fn copy_text_to_clipboard(text: String) -> Result<bool, String> {
 /// 检查更新
 #[tauri::command]
 pub async fn check_for_updates(handle: AppHandle) -> Result<bool, String> {
-    handle
-        .opener()
-        .open_url(
-            "https://github.com/farion1231/cc-switch/releases/latest",
-            None::<String>,
-        )
-        .map_err(|e| format!("打开更新页面失败: {e}"))?;
+    #[cfg(feature = "personal")]
+    {
+        let _ = handle;
+        return Ok(false);
+    }
 
-    Ok(true)
+    #[cfg(not(feature = "personal"))]
+    {
+        handle
+            .opener()
+            .open_url(
+                "https://github.com/farion1231/cc-switch/releases/latest",
+                None::<String>,
+            )
+            .map_err(|e| format!("打开更新页面失败: {e}"))?;
+
+        Ok(true)
+    }
 }
 
 /// 判断是否为便携版（绿色版）运行

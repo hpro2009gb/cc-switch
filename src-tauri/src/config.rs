@@ -6,6 +6,12 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::error::AppError;
 
+#[cfg(feature = "personal")]
+const APP_CONFIG_DIR_NAME: &str = ".cc-switch-personal";
+
+#[cfg(not(feature = "personal"))]
+const APP_CONFIG_DIR_NAME: &str = ".cc-switch";
+
 /// 获取用户主目录，带回退和日志
 ///
 /// ## Windows 注意事项
@@ -199,19 +205,19 @@ pub fn get_claude_settings_path() -> PathBuf {
     settings
 }
 
-/// 获取应用配置目录路径 (~/.cc-switch)
+/// 获取应用配置目录路径。
 pub fn get_app_config_dir() -> PathBuf {
     if let Some(custom) = crate::app_store::get_app_config_dir_override() {
         return custom;
     }
 
-    let default_dir = get_home_dir().join(".cc-switch");
+    let default_dir = get_home_dir().join(APP_CONFIG_DIR_NAME);
 
     // 兼容 v3.10.3：当用户环境存在 `HOME` 且与真实用户目录不同，
     // v3.10.3 可能在 `HOME/.cc-switch/` 下创建/使用了数据库。
     // 这里仅在“默认位置没有数据库”时回退到旧位置，避免再次出现“供应商消失”问题，
     // 同时也避免新安装因为 `HOME` 被设置而写入非预期路径。
-    #[cfg(windows)]
+    #[cfg(all(windows, not(feature = "personal")))]
     {
         let default_db = default_dir.join("cc-switch.db");
         if !default_db.exists() {

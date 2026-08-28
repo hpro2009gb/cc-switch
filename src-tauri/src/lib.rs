@@ -235,7 +235,7 @@ fn runtime_log_level_allows(level: log::Level, max_level: log::LevelFilter) -> b
     max_level.to_level().is_some_and(|maximum| level <= maximum)
 }
 
-/// 统一处理 ccswitch:// 深链接 URL
+/// 统一处理 CC Switch 深链接 URL
 ///
 /// - 解析 URL
 /// - 向前端发射 `deeplink-import` / `deeplink-error` 事件
@@ -246,7 +246,7 @@ fn handle_deeplink_url(
     focus_main_window: bool,
     source: &str,
 ) -> bool {
-    if !url_str.starts_with("ccswitch://") {
+    if !url_str.starts_with("ccswitch://") && !url_str.starts_with("ccswitch-personal://") {
         return false;
     }
 
@@ -483,8 +483,8 @@ pub fn run() {
             #[cfg(target_os = "windows")]
             set_windows_app_user_model_id(app.handle());
 
-            // 注册 Updater 插件（桌面端）；放在 logger 之后，确保失败可诊断。
-            #[cfg(desktop)]
+            // Personal builds never use the official update channel.
+            #[cfg(all(desktop, not(feature = "personal")))]
             {
                 if let Err(e) = app
                     .handle()
@@ -1645,6 +1645,7 @@ pub fn run() {
             commands::auth_poll_for_account,
             commands::auth_list_accounts,
             commands::auth_get_status,
+            commands::auth_import_chrome_cookies,
             commands::auth_remove_account,
             commands::auth_set_default_account,
             commands::auth_logout,
@@ -1770,7 +1771,7 @@ pub fn run() {
                         }
                     }
                 }
-                // 处理通过自定义 URL 协议触发的打开事件（例如 ccswitch://...）
+                // 处理通过自定义 URL 协议触发的打开事件。
                 RunEvent::Opened { urls } => {
                     if let Some(url) = urls.first() {
                         let url_str = url.to_string();
@@ -1779,7 +1780,9 @@ pub fn run() {
                             url_for_log(&url_str)
                         );
 
-                        if url_str.starts_with("ccswitch://") {
+                        if url_str.starts_with("ccswitch://")
+                            || url_str.starts_with("ccswitch-personal://")
+                        {
                             if crate::lightweight::is_lightweight_mode() {
                                 if let Err(e) = crate::lightweight::exit_lightweight_mode(app_handle)
                                 {

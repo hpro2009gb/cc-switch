@@ -5,9 +5,11 @@ describe("ProxyTabContent failover apps", () => {
   it("only exposes applications with local routing support", () => {
     expect(FAILOVER_APPS.map(({ id }) => id)).toEqual([
       "claude",
+      "claude-desktop",
       "codex",
       "gemini",
       "grokbuild",
+      "opencode",
     ]);
   });
 });

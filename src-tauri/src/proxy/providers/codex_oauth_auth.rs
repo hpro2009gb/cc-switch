@@ -133,6 +133,8 @@ struct OAuthTokenResponse {
 #[derive(Debug, Clone, Default, Deserialize)]
 struct IdTokenClaims {
     #[serde(default)]
+    exp: Option<i64>,
+    #[serde(default)]
     chatgpt_account_id: Option<String>,
     #[serde(default)]
     email: Option<String>,
@@ -186,7 +188,17 @@ struct CodexAccountData {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
     /// Refresh Token（持久化）
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub refresh_token: String,
+    /// Optional browser session cookie used to renew an imported web token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_cookie: Option<String>,
+    /// Access token obtained from the ChatGPT web session endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_token: Option<String>,
+    /// Expiry for the persisted browser access token, in Unix milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_token_expires_at_ms: Option<i64>,
     /// 认证时间戳（秒）
     pub authenticated_at: i64,
 }
@@ -523,13 +535,79 @@ impl CodexOAuthManager {
             }
         }
 
-        let refresh_token = {
+        let (refresh_token, session_cookie, access_token, access_token_expires_at_ms) = {
             let accounts = self.accounts.read().await;
-            accounts
+            let account = accounts
                 .get(account_id)
-                .map(|a| a.refresh_token.clone())
-                .ok_or_else(|| CodexOAuthError::AccountNotFound(account_id.to_string()))?
+                .ok_or_else(|| CodexOAuthError::AccountNotFound(account_id.to_string()))?;
+            (
+                account.refresh_token.clone(),
+                account.session_cookie.clone(),
+                account.access_token.clone(),
+                account.access_token_expires_at_ms,
+            )
         };
+
+        if let Some(access_token) = access_token {
+            let expires_at_ms =
+                access_token_expires_at_ms.unwrap_or_else(|| compute_expires_at_ms(None));
+            if expires_at_ms - chrono::Utc::now().timestamp_millis() >= TOKEN_REFRESH_BUFFER_MS {
+                let mut tokens = self.access_tokens.write().await;
+                tokens.insert(
+                    account_id.to_string(),
+                    CachedAccessToken {
+                        token: access_token.clone(),
+                        expires_at_ms,
+                    },
+                );
+                return Ok(access_token);
+            }
+        }
+
+        if let Some(session_cookie) = session_cookie {
+            let session =
+                crate::services::codex_chrome_import::fetch_session_with_cookie(&session_cookie)
+                    .await
+                    .map_err(CodexOAuthError::TokenFetchFailed)?;
+
+            if session.account_id != account_id {
+                return Err(CodexOAuthError::TokenFetchFailed(
+                    "Chrome session belongs to a different ChatGPT account".to_string(),
+                ));
+            }
+
+            let expires_at_ms = session
+                .expires_at_ms
+                .unwrap_or_else(|| compute_expires_at_ms(None));
+            {
+                let mut accounts = self.accounts.write().await;
+                if let Some(account) = accounts.get_mut(account_id) {
+                    account.access_token = Some(session.access_token.clone());
+                    account.access_token_expires_at_ms = Some(expires_at_ms);
+                    if session.email.is_some() {
+                        account.email = session.email.clone();
+                    }
+                }
+            }
+            self.save_to_disk().await?;
+
+            {
+                let mut tokens = self.access_tokens.write().await;
+                tokens.insert(
+                    account_id.to_string(),
+                    CachedAccessToken {
+                        token: session.access_token.clone(),
+                        expires_at_ms,
+                    },
+                );
+            }
+
+            return Ok(session.access_token);
+        }
+
+        if refresh_token.is_empty() {
+            return Err(CodexOAuthError::RefreshTokenInvalid);
+        }
 
         let new_tokens = self.refresh_with_token(&refresh_token).await?;
 
@@ -691,6 +769,60 @@ impl CodexOAuthManager {
 
     // ==================== 内部方法 ====================
 
+    /// Import a ChatGPT web session without exposing its cookie to the UI.
+    pub(crate) async fn import_browser_session(
+        &self,
+        session: crate::services::codex_chrome_import::CodexBrowserSession,
+    ) -> Result<GitHubAccount, CodexOAuthError> {
+        let now = chrono::Utc::now().timestamp();
+        let expires_at_ms = session
+            .expires_at_ms
+            .unwrap_or_else(|| compute_expires_at_ms(None));
+
+        let account = {
+            let mut accounts = self.accounts.write().await;
+            let data = accounts
+                .entry(session.account_id.clone())
+                .or_insert_with(|| CodexAccountData {
+                    account_id: session.account_id.clone(),
+                    email: None,
+                    refresh_token: String::new(),
+                    session_cookie: None,
+                    access_token: None,
+                    access_token_expires_at_ms: None,
+                    authenticated_at: now,
+                });
+
+            if session.email.is_some() {
+                data.email = session.email.clone();
+            }
+            data.session_cookie = Some(session.cookie_header.clone());
+            data.access_token = Some(session.access_token.clone());
+            data.access_token_expires_at_ms = Some(expires_at_ms);
+            GitHubAccount::from(&*data)
+        };
+
+        {
+            let mut default = self.default_account_id.write().await;
+            if default.is_none() {
+                *default = Some(session.account_id.clone());
+            }
+        }
+
+        self.save_to_disk().await?;
+
+        let mut tokens = self.access_tokens.write().await;
+        tokens.insert(
+            session.account_id,
+            CachedAccessToken {
+                token: session.access_token,
+                expires_at_ms,
+            },
+        );
+
+        Ok(account)
+    }
+
     async fn add_account_internal(
         &self,
         account_id: String,
@@ -703,6 +835,9 @@ impl CodexOAuthManager {
             account_id: account_id.clone(),
             email,
             refresh_token,
+            session_cookie: None,
+            access_token: None,
+            access_token_expires_at_ms: None,
             authenticated_at: now,
         };
 
@@ -924,6 +1059,32 @@ fn parse_jwt_claims(token: &str) -> Option<IdTokenClaims> {
     serde_json::from_slice(&decoded).ok()
 }
 
+pub(crate) fn extract_identity_from_access_token(
+    token: &str,
+) -> (Option<String>, Option<String>, Option<i64>) {
+    let Some(claims) = parse_jwt_claims(token) else {
+        return (None, None, None);
+    };
+
+    let account_id = claims
+        .chatgpt_account_id
+        .clone()
+        .or_else(|| {
+            claims
+                .openai_auth
+                .as_ref()
+                .and_then(|auth| auth.chatgpt_account_id.clone())
+        })
+        .or_else(|| claims.organizations.first().and_then(|org| org.id.clone()));
+
+    let expires_at_ms = claims
+        .exp
+        .filter(|exp| *exp > 0)
+        .map(|exp| exp.saturating_mul(1000));
+
+    (account_id, claims.email, expires_at_ms)
+}
+
 /// 从 token 响应中提取 (account_id, email)
 fn extract_identity_from_tokens(tokens: &OAuthTokenResponse) -> (Option<String>, Option<String>) {
     let mut account_id: Option<String> = None;
@@ -1070,6 +1231,32 @@ mod tests {
         let manager = CodexOAuthManager::new(temp.path().to_path_buf());
         assert!(!manager.is_authenticated().await);
         assert!(manager.list_accounts().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_import_browser_session_persists_cookie_and_token() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = CodexOAuthManager::new(temp.path().to_path_buf());
+        let expires_at_ms = chrono::Utc::now().timestamp_millis() + 3_600_000;
+
+        let account = manager
+            .import_browser_session(crate::services::codex_chrome_import::CodexBrowserSession {
+                access_token: "access-token".to_string(),
+                account_id: "acc-browser".to_string(),
+                email: Some("browser@example.com".to_string()),
+                expires_at_ms: Some(expires_at_ms),
+                cookie_header: "session-cookie=value".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(account.id, "acc-browser");
+        assert_eq!(account.login, "browser@example.com");
+        assert_eq!(manager.get_valid_token().await.unwrap(), "access-token");
+
+        let stored = std::fs::read_to_string(temp.path().join("codex_oauth_auth.json")).unwrap();
+        assert!(stored.contains("session-cookie=value"));
+        assert!(stored.contains("access-token"));
     }
 
     #[tokio::test]

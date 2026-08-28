@@ -3,8 +3,12 @@ import userEvent from "@testing-library/user-event";
 import { QueryClientProvider } from "@tanstack/react-query";
 import type { ComponentProps } from "react";
 import { describe, expect, it, vi } from "vitest";
+import { http, HttpResponse } from "msw";
 import { ClaudeDesktopProviderForm } from "@/components/providers/forms/ClaudeDesktopProviderForm";
 import { createTestQueryClient } from "../utils/testQueryClient";
+import { server } from "../msw/server";
+
+const TAURI_ENDPOINT = "http://tauri.local";
 
 vi.mock("@/lib/api/providers", () => ({
   providersApi: {
@@ -28,6 +32,47 @@ function renderForm(
     </QueryClientProvider>,
   );
   return { ...view, onSubmit };
+}
+
+function installCodexOauthHandlers() {
+  let modelRequestCount = 0;
+
+  server.use(
+    http.post(`${TAURI_ENDPOINT}/auth_get_status`, async ({ request }) => {
+      const body = (await request.json()) as { authProvider?: string };
+      const isCodex = body.authProvider === "codex_oauth";
+
+      return HttpResponse.json({
+        provider: body.authProvider ?? "unknown",
+        authenticated: isCodex,
+        default_account_id: isCodex ? "chatgpt-account-1" : null,
+        migration_error: null,
+        accounts: isCodex
+          ? [
+              {
+                id: "chatgpt-account-1",
+                provider: "codex_oauth",
+                login: "chatgpt@example.com",
+                avatar_url: null,
+                authenticated_at: 1,
+                is_default: true,
+                github_domain: "github.com",
+                requires_reauth: false,
+              },
+            ]
+          : [],
+      });
+    }),
+    http.post(`${TAURI_ENDPOINT}/get_codex_oauth_models`, () => {
+      modelRequestCount += 1;
+      return HttpResponse.json([
+        { id: "gpt-5.6-sol", ownedBy: "Codex" },
+        { id: "gpt-5.6-luna", ownedBy: "Codex" },
+      ]);
+    }),
+  );
+
+  return { getModelRequestCount: () => modelRequestCount };
 }
 
 describe("ClaudeDesktopProviderForm", () => {
@@ -68,6 +113,50 @@ describe("ClaudeDesktopProviderForm", () => {
     ).toHaveTextContent("直连");
     expect(screen.getByText("模型列表")).toBeInTheDocument();
     expect(screen.queryByText("模型角色")).not.toBeInTheDocument();
+  });
+
+  it("Codex OAuth 可从 ChatGPT 获取模型并保存到 Claude Desktop 路由", async () => {
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
+      configurable: true,
+      value: vi.fn(),
+    });
+    const handlers = installCodexOauthHandlers();
+    const user = userEvent.setup();
+    const onSubmit = vi.fn();
+    renderForm(undefined, onSubmit);
+
+    await user.click(screen.getByRole("button", { name: "OpenAI Codex" }));
+    await screen.findAllByText("chatgpt@example.com");
+    const fetchButton = screen.getByRole("button", { name: "获取模型" });
+    expect(fetchButton).toBeEnabled();
+
+    await user.click(fetchButton);
+    await waitFor(() => expect(handlers.getModelRequestCount()).toBe(1));
+    await waitFor(() =>
+      expect(
+        screen.getAllByRole("button", { name: "Select model" }),
+      ).toHaveLength(4),
+    );
+
+    await user.click(
+      screen.getAllByRole("button", { name: "Select model" })[0],
+    );
+    await user.click(
+      await screen.findByRole("option", { name: "gpt-5.6-luna" }),
+    );
+    await user.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalled());
+    const submitted = onSubmit.mock.calls[0][0];
+    const routes = submitted.meta.claudeDesktopModelRoutes;
+
+    expect(Object.values(routes)).toContainEqual(
+      expect.objectContaining({ model: "gpt-5.6-luna" }),
+    );
+    expect(submitted.meta.authBinding).toMatchObject({
+      source: "managed_account",
+      authProvider: "codex_oauth",
+    });
   });
 
   it("直连预设保留预设模型列表", async () => {

@@ -428,6 +428,14 @@ impl AppType {
         )
     }
 
+    /// Apps whose request data plane is routed by CC Switch and can therefore
+    /// use the shared failover queue. Claude Desktop owns a gateway profile and
+    /// OpenCode owns a managed additive provider, so neither uses the generic
+    /// live-takeover writer above.
+    pub fn supports_failover(&self) -> bool {
+        self.supports_local_proxy() || matches!(self, AppType::ClaudeDesktop | AppType::OpenCode)
+    }
+
     /// Return an iterator over all app types
     pub fn all() -> impl Iterator<Item = AppType> {
         [
@@ -1019,6 +1027,13 @@ mod tests {
             AppType::ClaudeDesktop
         );
         assert_eq!(AppType::ClaudeDesktop.as_str(), "claude-desktop");
+    }
+
+    #[test]
+    fn failover_capability_includes_managed_cowork_and_opencode_gateways() {
+        assert!(AppType::ClaudeDesktop.supports_failover());
+        assert!(AppType::OpenCode.supports_failover());
+        assert!(!AppType::Pi.supports_failover());
     }
 
     struct TempHome {

@@ -725,10 +725,28 @@ fn codex_catalog_model_specs(settings: &Value) -> Vec<CodexCatalogModelSpec> {
 }
 
 fn find_codex_model_template(catalog: &Value) -> Option<Value> {
-    catalog
-        .get("models")
-        .and_then(|models| models.as_array())
-        .and_then(|models| {
+    let models = catalog.get("models").and_then(|models| models.as_array())?;
+
+    // Ultra is a Codex harness capability (automatic task delegation), not an
+    // OpenAI speed tier. Prefer a visible local model that advertises it so a
+    // provider switch does not silently downgrade the Desktop mode selector.
+    // Older Codex versions do not know this enum value, so only inherit it from
+    // their own cache/bundled catalog and retain the gpt-5.5 fallback below.
+    models
+        .iter()
+        .find(|model| {
+            model.get("visibility").and_then(Value::as_str) != Some("hide")
+                && model.get("supported_in_api").and_then(Value::as_bool) != Some(false)
+                && model
+                    .get("supported_reasoning_levels")
+                    .and_then(Value::as_array)
+                    .is_some_and(|levels| {
+                        levels.iter().any(|level| {
+                            level.get("effort").and_then(Value::as_str) == Some("ultra")
+                        })
+                    })
+        })
+        .or_else(|| {
             models.iter().find(|model| {
                 model.get("slug").and_then(|slug| slug.as_str())
                     == Some(CODEX_MODEL_CATALOG_TEMPLATE_SLUG)
@@ -2213,8 +2231,8 @@ pub fn restore_codex_settings_for_backfill(
 /// Supported fields:
 /// - `"base_url"`: writes to `[model_providers.<current>].base_url` if `model_provider` exists,
 ///   otherwise falls back to top-level `base_url`.
-/// - `"wire_api"`: writes to `[model_providers.<current>].wire_api` if `model_provider` exists,
-///   otherwise falls back to top-level `wire_api`.
+/// - `"wire_api"` / `"requires_openai_auth"`: writes to the active provider table if
+///   `model_provider` exists, otherwise falls back to the top level.
 /// - `"model"` / `"model_catalog_json"`: writes to top-level field.
 ///
 /// Empty value removes the field.
@@ -2226,7 +2244,7 @@ pub fn update_codex_toml_field(toml_str: &str, field: &str, value: &str) -> Resu
     let trimmed = value.trim();
 
     match field {
-        "base_url" | "wire_api" => {
+        "base_url" | "wire_api" | "requires_openai_auth" => {
             let model_provider = doc
                 .get("model_provider")
                 .and_then(|item| item.as_str())
@@ -3238,6 +3256,76 @@ base_url = "https://production.api/v1"
                 .and_then(Value::as_bool),
             Some(true)
         );
+    }
+
+    #[test]
+    fn codex_catalog_template_prefers_local_ultra_capability() {
+        let catalog = json!({
+            "models": [
+                {
+                    "slug": "gpt-5.5",
+                    "visibility": "list",
+                    "supported_in_api": true,
+                    "supported_reasoning_levels": [{ "effort": "xhigh" }]
+                },
+                {
+                    "slug": "gpt-5.6-sol-wm",
+                    "visibility": "hide",
+                    "supported_in_api": false,
+                    "supported_reasoning_levels": [{ "effort": "ultra" }]
+                },
+                {
+                    "slug": "gpt-5.6-sol",
+                    "visibility": "list",
+                    "supported_in_api": true,
+                    "supported_reasoning_levels": [
+                        { "effort": "xhigh" },
+                        {
+                            "effort": "ultra",
+                            "description": "Maximum reasoning with automatic task delegation"
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let template = find_codex_model_template(&catalog).expect("catalog template");
+        assert_eq!(template["slug"], "gpt-5.6-sol");
+        let generated = codex_model_catalog_from_specs(
+            &[CodexCatalogModelSpec {
+                model: "relay-gpt-5.6".to_string(),
+                display_name: None,
+                context_window: None,
+                supports_parallel_tool_calls: None,
+                input_modalities: None,
+                base_instructions: None,
+            }],
+            &template,
+            CodexCatalogToolProfile::ProxyChat,
+            128_000,
+        );
+        assert!(generated["models"][0]["supported_reasoning_levels"]
+            .as_array()
+            .is_some_and(|levels| levels.iter().any(|level| level["effort"] == "ultra")));
+    }
+
+    #[test]
+    fn codex_catalog_template_falls_back_for_pre_ultra_codex() {
+        let catalog = json!({
+            "models": [
+                {
+                    "slug": "gpt-5.4",
+                    "supported_reasoning_levels": [{ "effort": "high" }]
+                },
+                {
+                    "slug": "gpt-5.5",
+                    "supported_reasoning_levels": [{ "effort": "xhigh" }]
+                }
+            ]
+        });
+
+        let template = find_codex_model_template(&catalog).expect("catalog template");
+        assert_eq!(template["slug"], "gpt-5.5");
     }
 
     #[test]

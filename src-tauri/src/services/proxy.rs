@@ -449,6 +449,31 @@ impl ProxyService {
         live_taken_over: bool,
         previous_live_before_direct_write: Option<&Value>,
     ) {
+        if matches!(app_type, AppType::ClaudeDesktop | AppType::OpenCode) {
+            if let Some(previous_provider_id) = previous_provider_id {
+                if let Ok(Some(previous_provider)) = self
+                    .db
+                    .get_provider_by_id(previous_provider_id, app_type.as_str())
+                {
+                    let result = if matches!(app_type, AppType::ClaudeDesktop) {
+                        crate::claude_desktop_config::apply_provider(
+                            self.db.as_ref(),
+                            &previous_provider,
+                        )
+                        .map_err(|error| error.to_string())
+                    } else {
+                        self.sync_opencode_gateway_provider(&previous_provider)
+                            .await
+                    };
+                    if let Err(error) = result {
+                        log::error!(
+                            "{} 热切换失败后恢复 managed profile 失败: {error}",
+                            app_type.as_str()
+                        );
+                    }
+                }
+            }
+        }
         if !should_sync_backup {
             return;
         }
@@ -581,6 +606,84 @@ impl ProxyService {
         Ok(info)
     }
 
+    /// Enable the managed OpenCode gateway without changing any of the user's
+    /// additive provider entries. The selected provider remains the logical
+    /// target used by the router and failover queue.
+    pub async fn enable_opencode_gateway(&self, provider_id: &str) -> Result<(), String> {
+        let _guard = self.switch_locks.lock_for_app("opencode").await;
+        let provider = self
+            .db
+            .get_provider_by_id(provider_id, "opencode")
+            .map_err(|error| format!("读取 OpenCode provider 失败: {error}"))?
+            .ok_or_else(|| format!("OpenCode provider 不存在: {provider_id}"))?;
+        self.start().await?;
+        self.sync_opencode_gateway_provider(&provider).await?;
+
+        crate::settings::set_current_provider(&AppType::OpenCode, Some(provider_id))
+            .map_err(|error| format!("保存 OpenCode gateway target 失败: {error}"))?;
+        self.db
+            .set_current_provider("opencode", provider_id)
+            .map_err(|error| format!("保存 OpenCode gateway target 失败: {error}"))?;
+        let mut app_config = self
+            .db
+            .get_proxy_config_for_app("opencode")
+            .await
+            .map_err(|error| format!("读取 OpenCode proxy config 失败: {error}"))?;
+        app_config.enabled = true;
+        self.db
+            .update_proxy_config_for_app(app_config)
+            .await
+            .map_err(|error| format!("启用 OpenCode local gateway 失败: {error}"))?;
+        if let Some(server) = self.server.read().await.as_ref() {
+            server
+                .set_active_target("opencode", &provider.id, &provider.name)
+                .await;
+        }
+        Ok(())
+    }
+
+    pub async fn disable_opencode_gateway(&self) -> Result<(), String> {
+        let _guard = self.switch_locks.lock_for_app("opencode").await;
+        crate::opencode_config::remove_managed_gateway_provider()
+            .map_err(|error| format!("移除 OpenCode gateway provider 失败: {error}"))?;
+        let mut app_config = self
+            .db
+            .get_proxy_config_for_app("opencode")
+            .await
+            .map_err(|error| format!("读取 OpenCode proxy config 失败: {error}"))?;
+        app_config.enabled = false;
+        app_config.auto_failover_enabled = false;
+        self.db
+            .update_proxy_config_for_app(app_config)
+            .await
+            .map_err(|error| format!("关闭 OpenCode local gateway 失败: {error}"))?;
+        crate::settings::set_current_provider(&AppType::OpenCode, None)
+            .map_err(|error| format!("清除 OpenCode gateway target 失败: {error}"))?;
+        Ok(())
+    }
+
+    async fn sync_opencode_gateway_provider(&self, provider: &Provider) -> Result<(), String> {
+        let config = self
+            .db
+            .get_proxy_config()
+            .await
+            .map_err(|error| format!("读取代理地址失败: {error}"))?;
+        if config.listen_port == 0 {
+            return Err("OpenCode local gateway requires a resolved listen port".to_string());
+        }
+        let base_url = format!("http://127.0.0.1:{}/opencode/v1", config.listen_port);
+        crate::opencode_config::set_managed_gateway_provider(json!({
+            "npm": "@ai-sdk/openai",
+            "name": "CC Switch local gateway",
+            "options": {
+                "baseURL": base_url,
+                "apiKey": PROXY_TOKEN_PLACEHOLDER,
+            },
+            "models": provider.settings_config.get("models").cloned().unwrap_or_else(|| json!({})),
+        }))
+        .map_err(|error| format!("写入 OpenCode gateway provider 失败: {error}"))
+    }
+
     async fn persist_ephemeral_listen_port_if_needed(
         &self,
         config: &ProxyConfig,
@@ -707,6 +810,12 @@ impl ProxyService {
             .await
             .map(|c| c.enabled)
             .unwrap_or(false);
+        let claude_desktop_enabled = self
+            .db
+            .get_proxy_config_for_app("claude-desktop")
+            .await
+            .map(|c| c.enabled)
+            .unwrap_or(false);
         let gemini_enabled = self
             .db
             .get_proxy_config_for_app("gemini")
@@ -719,12 +828,17 @@ impl ProxyService {
             .await
             .map(|c| c.enabled)
             .unwrap_or(false);
-        // OpenCode and OpenClaw don't support proxy features, always return false
-        let opencode_enabled = false;
+        let opencode_enabled = self
+            .db
+            .get_proxy_config_for_app("opencode")
+            .await
+            .map(|c| c.enabled)
+            .unwrap_or(false);
         let openclaw_enabled = false;
 
         Ok(ProxyTakeoverStatus {
             claude: claude_enabled,
+            claude_desktop: claude_desktop_enabled,
             codex: codex_enabled,
             gemini: gemini_enabled,
             grokbuild: grokbuild_enabled,
@@ -2546,6 +2660,15 @@ impl ProxyService {
             };
 
         let prepare_result: Result<(), String> = async {
+            // Cowork owns a profile rather than a generic live-config backup.
+            // Apply the new profile before committing the logical target so a
+            // failover cannot leave its model list pointing at the old provider.
+            if matches!(app_type_enum, AppType::ClaudeDesktop) {
+                crate::claude_desktop_config::apply_provider(self.db.as_ref(), &provider)
+                    .map_err(|error| format!("更新 Claude Cowork profile 失败: {error}"))?;
+            } else if matches!(app_type_enum, AppType::OpenCode) {
+                self.sync_opencode_gateway_provider(&provider).await?;
+            }
             if should_sync_backup {
                 self.update_live_backup_from_provider_inner(app_type, &provider)
                     .await?;
@@ -2817,7 +2940,7 @@ impl ProxyService {
         provider_id: &str,
     ) -> Result<(), String> {
         let app = AppType::from_str(app_type).map_err(|e| format!("无效的应用类型: {e}"))?;
-        if !app.supports_local_proxy() {
+        if !app.supports_failover() {
             return Err(format!("{} 不支持本地路由", app.as_str()));
         }
         let outcome = self.hot_switch_provider(app_type, provider_id).await?;
@@ -2849,6 +2972,9 @@ impl ProxyService {
         let mut updated =
             crate::codex_config::update_codex_toml_field(&updated, "wire_api", "responses")
                 .map_err(|e| format!("更新 Codex wire_api 失败: {e}"))?;
+        updated =
+            crate::codex_config::update_codex_toml_field(&updated, "requires_openai_auth", "")
+                .map_err(|e| format!("更新 Codex 认证模式失败: {e}"))?;
 
         if let Some(upstream_model) =
             provider.and_then(crate::proxy::providers::codex_provider_upstream_model)
@@ -5181,6 +5307,7 @@ model = "gpt-5.1-codex"
 name = "Chat Only"
 base_url = "https://chat-only.example/v1"
 wire_api = "chat"
+requires_openai_auth = true
 "#;
 
         let proxy_url = "http://127.0.0.1:5000/v1";
@@ -5203,6 +5330,7 @@ wire_api = "chat"
             provider.get("wire_api").and_then(|v| v.as_str()),
             Some("responses")
         );
+        assert!(provider.get("requires_openai_auth").is_none());
     }
 
     #[test]

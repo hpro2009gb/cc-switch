@@ -1,23 +1,32 @@
 //! Safe provider onboarding primitives.
 //!
-//! This module only probes and reports capabilities. It never persists a
-//! provider or writes an IDE configuration file.
+//! The probe phase is read-only; preview and apply intentionally persist the
+//! selected provider through the normal provider services.
 
 use crate::proxy::http_client;
 use crate::services::model_fetch::build_models_url_candidates;
 use crate::{app_config::AppType, codex_config, config};
-use crate::{provider::Provider, provider::ProviderMeta, store::AppState};
+use crate::{
+    provider::{
+        ClaudeDesktopMode, ClaudeDesktopModelRoute, OpenCodeModel, OpenCodeProviderConfig,
+        OpenCodeProviderOptions, Provider, ProviderMeta,
+    },
+    store::AppState,
+};
 use once_cell::sync::Lazy;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONNECTION};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tokio::sync::Mutex;
+use toml_edit::{value, DocumentMut, Item, Table};
 use url::Url;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_MODELS_BODY_BYTES: usize = 2 * 1024 * 1024;
+const MAX_DISCOVERED_MODELS: usize = 5_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -59,11 +68,12 @@ pub struct ProviderProbeInput {
     pub allow_inference_probe: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DetectedModel {
     pub id: String,
     pub owned_by: Option<String>,
+    pub display_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,8 +105,12 @@ pub struct ProviderInstallSelection {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    #[serde(default)]
+    pub models: Vec<DetectedModel>,
     pub claude_protocol: Option<UpstreamProtocol>,
     pub codex_protocol: Option<UpstreamProtocol>,
+    pub claude_desktop_protocol: Option<UpstreamProtocol>,
+    pub opencode_protocol: Option<UpstreamProtocol>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,6 +135,8 @@ pub struct ProviderInstallPreview {
     pub url_mode: UrlMode,
     pub claude: Option<AppInstallPreview>,
     pub codex: Option<AppInstallPreview>,
+    pub claude_desktop: Option<AppInstallPreview>,
+    pub opencode: Option<AppInstallPreview>,
     pub proxy_will_start: bool,
     pub warnings: Vec<String>,
 }
@@ -177,12 +193,33 @@ pub async fn probe_provider_capabilities(
     )
     .await?;
 
-    let selected_model = input
-        .model
-        .filter(|model| !model.trim().is_empty())
-        .or_else(|| models.first().map(|model| model.id.clone()));
-
     let mut warnings = Vec::new();
+    let requested_model = input
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty());
+    let selected_model = if models.is_empty() {
+        requested_model.map(str::to_string)
+    } else {
+        requested_model
+            .and_then(|requested| {
+                models
+                    .iter()
+                    .find(|model| model.id == requested)
+                    .map(|model| model.id.clone())
+            })
+            .or_else(|| models.first().map(|model| model.id.clone()))
+    };
+    if requested_model.is_some()
+        && selected_model.as_deref() != requested_model
+        && !models.is_empty()
+    {
+        warnings.push(
+            "The previously selected model is not in this provider catalog; probing with the first discovered model instead."
+                .to_string(),
+        );
+    }
     if selected_model.is_none() {
         warnings.push("No model was discovered; enter a model manually.".to_string());
     }
@@ -269,14 +306,24 @@ pub fn preview_provider_install(
     let codex = selection
         .codex_protocol
         .map(|protocol| build_codex_preview(&selection, &provider_id, protocol, model));
+    let claude_desktop = selection
+        .claude_desktop_protocol
+        .map(|protocol| build_claude_desktop_preview(&selection, &provider_id, protocol, model));
+    let opencode = selection
+        .opencode_protocol
+        .map(|protocol| build_opencode_preview(&selection, &provider_id, protocol, model))
+        .transpose()?;
 
-    if claude.is_none() && codex.is_none() {
+    if claude.is_none() && codex.is_none() && claude_desktop.is_none() && opencode.is_none() {
         warnings.push("Select at least one application to configure.".to_string());
     }
     let proxy_will_start = claude
         .as_ref()
         .is_some_and(|preview| preview.mode == "proxy")
         || codex
+            .as_ref()
+            .is_some_and(|preview| preview.mode == "proxy")
+        || claude_desktop
             .as_ref()
             .is_some_and(|preview| preview.mode == "proxy");
 
@@ -286,6 +333,8 @@ pub fn preview_provider_install(
         url_mode,
         claude,
         codex,
+        claude_desktop,
+        opencode,
         proxy_will_start,
         warnings,
     })
@@ -304,6 +353,8 @@ pub async fn apply_provider_install(
     for (app, protocol) in [
         (AppType::Claude, selection.claude_protocol),
         (AppType::Codex, selection.codex_protocol),
+        (AppType::ClaudeDesktop, selection.claude_desktop_protocol),
+        (AppType::OpenCode, selection.opencode_protocol),
     ] {
         let Some(protocol) = protocol else {
             continue;
@@ -336,6 +387,14 @@ pub async fn apply_provider_install(
                 .is_some_and(|item| item.mode == "proxy"),
             AppType::Codex => preview
                 .codex
+                .as_ref()
+                .is_some_and(|item| item.mode == "proxy"),
+            AppType::ClaudeDesktop => preview
+                .claude_desktop
+                .as_ref()
+                .is_some_and(|item| item.mode == "proxy"),
+            AppType::OpenCode => preview
+                .opencode
                 .as_ref()
                 .is_some_and(|item| item.mode == "proxy"),
             _ => false,
@@ -373,14 +432,43 @@ async fn apply_one_app(
     provider: Provider,
     proxy_will_start: bool,
 ) -> Result<(), String> {
+    // Cowork writes its gateway URL while adding the provider, so an ephemeral
+    // local port must be resolved before the Claude Desktop profile is written.
+    if proxy_will_start && app == AppType::ClaudeDesktop {
+        state.proxy_service.start().await?;
+    }
     crate::services::provider::ProviderService::add(state, app.clone(), provider.clone(), true)
         .map_err(|error| error.to_string())?;
+
+    if proxy_will_start && app == AppType::ClaudeDesktop {
+        let mut config = state
+            .db
+            .get_proxy_config_for_app(app.as_str())
+            .await
+            .map_err(|error| error.to_string())?;
+        config.enabled = true;
+        state
+            .db
+            .update_proxy_config_for_app(config)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
 
     if proxy_will_start && app.supports_local_proxy() {
         state
             .proxy_service
             .set_takeover_for_app(app.as_str(), true)
             .await?;
+    }
+
+    if app.is_additive_mode() {
+        if proxy_will_start && app == AppType::OpenCode {
+            state
+                .proxy_service
+                .enable_opencode_gateway(&provider.id)
+                .await?;
+        }
+        return Ok(());
     }
 
     crate::services::provider::ProviderService::switch(state, app, &provider.id)
@@ -399,7 +487,10 @@ async fn rollback_install(state: &AppState, snapshots: &[InstallSnapshot]) -> Ve
 }
 
 async fn rollback_one_app(state: &AppState, snapshot: &InstallSnapshot) -> Result<(), String> {
-    if snapshot.previous_takeover {
+    if snapshot.app == AppType::OpenCode && !snapshot.previous_takeover {
+        state.proxy_service.disable_opencode_gateway().await?;
+    }
+    if snapshot.previous_takeover && snapshot.app != AppType::OpenCode {
         state
             .proxy_service
             .set_takeover_for_app(snapshot.app.as_str(), true)
@@ -410,12 +501,34 @@ async fn rollback_one_app(state: &AppState, snapshot: &InstallSnapshot) -> Resul
             .set_takeover_for_app(snapshot.app.as_str(), false)
             .await?;
     }
+    if snapshot.app == AppType::ClaudeDesktop {
+        let mut config = state
+            .db
+            .get_proxy_config_for_app(snapshot.app.as_str())
+            .await
+            .map_err(|error| error.to_string())?;
+        config.enabled = snapshot.previous_takeover;
+        state
+            .db
+            .update_proxy_config_for_app(config)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
 
     if let Some(previous_provider) = &snapshot.previous_provider {
         state
             .db
             .save_provider(snapshot.app.as_str(), previous_provider)
             .map_err(|error| error.to_string())?;
+        if snapshot.app.is_additive_mode() {
+            crate::services::provider::ProviderService::update(
+                state,
+                snapshot.app.clone(),
+                None,
+                previous_provider.clone(),
+            )
+            .map_err(|error| error.to_string())?;
+        }
         if let Some(previous_current) = &snapshot.previous_current {
             crate::settings::set_current_provider(&snapshot.app, Some(previous_current))
                 .map_err(|error| error.to_string())?;
@@ -429,8 +542,22 @@ async fn rollback_one_app(state: &AppState, snapshot: &InstallSnapshot) -> Resul
                 previous_current,
             )
             .map_err(|error| error.to_string())?;
+            if snapshot.app == AppType::OpenCode && snapshot.previous_takeover {
+                state
+                    .proxy_service
+                    .enable_opencode_gateway(previous_current)
+                    .await?;
+            }
         }
     } else {
+        if snapshot.app.is_additive_mode() {
+            crate::services::provider::ProviderService::remove_from_live_config(
+                state,
+                snapshot.app.clone(),
+                &snapshot.provider_id,
+            )
+            .map_err(|error| error.to_string())?;
+        }
         state
             .db
             .delete_provider(snapshot.app.as_str(), &snapshot.provider_id)
@@ -482,14 +609,92 @@ fn build_provider_for_app(
             )
         }
         AppType::Codex => {
-            let config_text = format!(
-                "model_provider = \"{provider_id}\"\nmodel = \"{model}\"\n\n[model_providers.{provider_id}]\nname = \"{}\"\nbase_url = \"{base_url}\"\nwire_api = \"responses\"\nrequires_openai_auth = true\n",
-                selection.name.trim()
-            );
+            let config_text =
+                build_codex_config_text(provider_id, selection.name.trim(), &base_url, model);
             let settings = serde_json::json!({
                 "auth": {"OPENAI_API_KEY": selection.api_key.clone()},
                 "config": config_text,
+                "modelCatalog": build_codex_model_catalog(selection),
             });
+            Provider::with_id(
+                provider_id.to_string(),
+                selection.name.clone(),
+                settings,
+                None,
+            )
+        }
+        AppType::ClaudeDesktop => {
+            let models = normalized_install_models(selection);
+            let uses_proxy = protocol != UpstreamProtocol::AnthropicMessages
+                || models.iter().any(|detected| {
+                    !crate::claude_desktop_config::is_claude_safe_model_id(&detected.id)
+                });
+            let routes = build_claude_desktop_model_routes(&models, uses_proxy);
+            let settings = serde_json::json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": base_url,
+                    "ANTHROPIC_AUTH_TOKEN": selection.api_key.clone(),
+                    "ANTHROPIC_MODEL": model,
+                }
+            });
+            let mut provider = Provider::with_id(
+                provider_id.to_string(),
+                selection.name.clone(),
+                settings,
+                None,
+            );
+            provider.meta = Some(ProviderMeta {
+                api_format: Some(protocol_string(protocol).to_string()),
+                api_key_field: Some("ANTHROPIC_AUTH_TOKEN".to_string()),
+                claude_desktop_mode: Some(if uses_proxy {
+                    ClaudeDesktopMode::Proxy
+                } else {
+                    ClaudeDesktopMode::Direct
+                }),
+                claude_desktop_model_routes: routes,
+                is_full_url: (url_mode == UrlMode::FullEndpoint).then_some(true),
+                ..ProviderMeta::default()
+            });
+            return Ok(provider);
+        }
+        AppType::OpenCode => {
+            if url_mode == UrlMode::FullEndpoint {
+                return Err(
+                    "OpenCode native setup requires a base URL, not a full endpoint".to_string(),
+                );
+            }
+            let npm = match protocol {
+                UpstreamProtocol::AnthropicMessages => "@ai-sdk/anthropic",
+                UpstreamProtocol::OpenAiChat => "@ai-sdk/openai-compatible",
+                UpstreamProtocol::OpenAiResponses => "@ai-sdk/openai",
+            };
+            let models = normalized_install_models(selection)
+                .into_iter()
+                .map(|detected| {
+                    let name = codex_catalog_display_name(&detected);
+                    (
+                        detected.id,
+                        OpenCodeModel {
+                            name,
+                            limit: None,
+                            options: None,
+                            extra: HashMap::new(),
+                        },
+                    )
+                })
+                .collect();
+            let settings = serde_json::to_value(OpenCodeProviderConfig {
+                npm: npm.to_string(),
+                name: Some(selection.name.trim().to_string()),
+                options: OpenCodeProviderOptions {
+                    base_url: Some(base_url),
+                    api_key: Some(selection.api_key.clone()),
+                    headers: None,
+                    extra: HashMap::new(),
+                },
+                models,
+            })
+            .map_err(|error| format!("Failed to serialize OpenCode provider: {error}"))?;
             Provider::with_id(
                 provider_id.to_string(),
                 selection.name.clone(),
@@ -519,12 +724,134 @@ fn build_provider_for_app(
     Ok(provider)
 }
 
+fn build_claude_desktop_model_routes(
+    models: &[DetectedModel],
+    proxy: bool,
+) -> HashMap<String, ClaudeDesktopModelRoute> {
+    let mut routes = HashMap::new();
+    for (index, detected) in models.iter().enumerate() {
+        let route_id =
+            if !proxy && crate::claude_desktop_config::is_claude_safe_model_id(&detected.id) {
+                detected.id.clone()
+            } else {
+                let base = match index % 4 {
+                    0 => "claude-sonnet-4-6",
+                    1 => "claude-opus-4-6",
+                    2 => "claude-haiku-4-5",
+                    _ => "claude-fable-5",
+                };
+                if index < 4 {
+                    base.to_string()
+                } else {
+                    format!("{base}-r{}", index / 4 + 1)
+                }
+            };
+        routes.insert(
+            route_id,
+            ClaudeDesktopModelRoute {
+                model: detected.id.clone(),
+                label_override: Some(codex_catalog_display_name(detected)),
+                supports_1m: None,
+            },
+        );
+    }
+    routes
+}
+
 fn protocol_string(protocol: UpstreamProtocol) -> &'static str {
     match protocol {
         UpstreamProtocol::AnthropicMessages => "anthropic",
         UpstreamProtocol::OpenAiChat => "openai_chat",
         UpstreamProtocol::OpenAiResponses => "openai_responses",
     }
+}
+
+fn build_codex_config_text(
+    provider_id: &str,
+    provider_name: &str,
+    base_url: &str,
+    model: &str,
+) -> String {
+    let mut doc = DocumentMut::new();
+    doc["model_provider"] = value(provider_id);
+    doc["model"] = value(model);
+
+    let mut provider = Table::new();
+    provider["name"] = value(provider_name);
+    provider["base_url"] = value(base_url);
+    provider["wire_api"] = value("responses");
+
+    let mut providers = Table::new();
+    providers.set_implicit(true);
+    providers.insert(provider_id, Item::Table(provider));
+    doc["model_providers"] = Item::Table(providers);
+    doc.to_string()
+}
+
+fn normalized_install_models(selection: &ProviderInstallSelection) -> Vec<DetectedModel> {
+    let mut models = Vec::new();
+    let mut seen = HashSet::new();
+
+    for detected in &selection.models {
+        let id = detected.id.trim();
+        if id.is_empty() || !seen.insert(id.to_string()) {
+            continue;
+        }
+        models.push(DetectedModel {
+            id: id.to_string(),
+            owned_by: detected
+                .owned_by
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            display_name: detected
+                .display_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+        });
+    }
+
+    let default_model = selection.model.trim();
+    if !default_model.is_empty() && seen.insert(default_model.to_string()) {
+        models.push(DetectedModel {
+            id: default_model.to_string(),
+            owned_by: None,
+            display_name: None,
+        });
+    }
+    models
+}
+
+fn codex_catalog_display_name(model: &DetectedModel) -> String {
+    let Some(display_name) = model
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && *name != model.id)
+    else {
+        return model.id.clone();
+    };
+    if display_name.contains(&model.id) {
+        display_name.to_string()
+    } else {
+        format!("{display_name} ({})", model.id)
+    }
+}
+
+fn build_codex_model_catalog(selection: &ProviderInstallSelection) -> Value {
+    let models = normalized_install_models(selection)
+        .into_iter()
+        .map(|model| {
+            serde_json::json!({
+                "model": model.id,
+                "displayName": codex_catalog_display_name(&model),
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({ "models": models })
 }
 
 fn build_claude_preview(
@@ -576,13 +903,11 @@ fn build_codex_preview(
 ) -> AppInstallPreview {
     let proxy = protocol != UpstreamProtocol::OpenAiResponses;
     let base_url = selection.base_url.trim().trim_end_matches('/');
-    let config_text = format!(
-        "model_provider = \"{provider_id}\"\nmodel = \"{model}\"\n\n[model_providers.{provider_id}]\nname = \"{}\"\nbase_url = \"{base_url}\"\nwire_api = \"responses\"\nrequires_openai_auth = true\n",
-        selection.name.trim()
-    );
+    let config_text = build_codex_config_text(provider_id, selection.name.trim(), base_url, model);
     let redacted_config = serde_json::json!({
         "auth": {"OPENAI_API_KEY": redact_secret(&selection.api_key)},
         "config": config_text,
+        "modelCatalog": build_codex_model_catalog(selection),
         "meta": {"apiFormat": protocol}
     });
     let mut warnings = Vec::new();
@@ -603,6 +928,99 @@ fn build_codex_preview(
         redacted_config,
         warnings,
     }
+}
+
+fn build_claude_desktop_preview(
+    selection: &ProviderInstallSelection,
+    provider_id: &str,
+    protocol: UpstreamProtocol,
+    model: &str,
+) -> AppInstallPreview {
+    let models = normalized_install_models(selection);
+    let proxy = protocol != UpstreamProtocol::AnthropicMessages
+        || models
+            .iter()
+            .any(|detected| !crate::claude_desktop_config::is_claude_safe_model_id(&detected.id));
+    let routes = build_claude_desktop_model_routes(&models, proxy);
+    let route_count = routes.len();
+    let mut warnings = Vec::new();
+    if proxy {
+        warnings.push(
+            "Claude Cowork will use the CC Switch local gateway so every discovered model can be routed safely."
+                .to_string(),
+        );
+    }
+    AppInstallPreview {
+        app: AppType::ClaudeDesktop,
+        provider_id: provider_id.to_string(),
+        protocol,
+        mode: if proxy { "proxy" } else { "direct" }.to_string(),
+        model: model.to_string(),
+        files_to_change: crate::claude_desktop_config::get_config_library_path()
+            .map(|path| vec![path.display().to_string()])
+            .unwrap_or_default(),
+        restart_required: true,
+        redacted_config: serde_json::json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": selection.base_url.trim().trim_end_matches('/'),
+                "ANTHROPIC_AUTH_TOKEN": redact_secret(&selection.api_key),
+            },
+            "meta": {
+                "apiFormat": protocol,
+                "claudeDesktopMode": if proxy { "proxy" } else { "direct" },
+                "modelRouteCount": route_count,
+            }
+        }),
+        warnings,
+    }
+}
+
+fn build_opencode_preview(
+    selection: &ProviderInstallSelection,
+    provider_id: &str,
+    protocol: UpstreamProtocol,
+    model: &str,
+) -> Result<AppInstallPreview, String> {
+    let (_, url_mode, _) = normalize_base_url(&selection.base_url)?;
+    if url_mode == UrlMode::FullEndpoint {
+        return Err("OpenCode native setup requires a base URL, not a full endpoint".to_string());
+    }
+    let npm = match protocol {
+        UpstreamProtocol::AnthropicMessages => "@ai-sdk/anthropic",
+        UpstreamProtocol::OpenAiChat => "@ai-sdk/openai-compatible",
+        UpstreamProtocol::OpenAiResponses => "@ai-sdk/openai",
+    };
+    let models = normalized_install_models(selection)
+        .into_iter()
+        .map(|detected| {
+            let display_name = codex_catalog_display_name(&detected);
+            (detected.id, display_name)
+        })
+        .collect::<HashMap<_, _>>();
+    Ok(AppInstallPreview {
+        app: AppType::OpenCode,
+        provider_id: provider_id.to_string(),
+        protocol,
+        mode: "proxy".to_string(),
+        model: model.to_string(),
+        files_to_change: vec![crate::opencode_config::get_opencode_config_path()
+            .display()
+            .to_string()],
+        restart_required: false,
+        redacted_config: serde_json::json!({
+            "npm": npm,
+            "name": selection.name.trim(),
+            "options": {
+                "baseURL": selection.base_url.trim().trim_end_matches('/'),
+                "apiKey": redact_secret(&selection.api_key),
+            },
+            "models": models,
+        }),
+        warnings: vec![
+            "OpenCode keeps the native provider entry and adds the CC Switch local gateway for optional failover."
+                .to_string(),
+        ],
+    })
 }
 
 fn wizard_provider_id(name: &str, base_url: &str) -> String {
@@ -680,10 +1098,16 @@ fn endpoint_url(base_url: &str, mode: UrlMode, path: &str) -> Result<String, Str
 
     let mut base = Url::parse(base_url).map_err(|error| format!("Invalid base URL: {error}"))?;
     let current_path = base.path().trim_end_matches('/');
-    let joined_path = if current_path.ends_with("/v1") {
-        format!("{current_path}{}", path.strip_prefix("/v1").unwrap_or(path))
+    let endpoint_suffix = path.strip_prefix("/v1").unwrap_or(path);
+    let has_version_suffix = current_path
+        .rsplit('/')
+        .next()
+        .and_then(|segment| segment.strip_prefix('v'))
+        .is_some_and(|version| !version.is_empty() && version.chars().all(|c| c.is_ascii_digit()));
+    let joined_path = if has_version_suffix {
+        format!("{current_path}{endpoint_suffix}")
     } else {
-        format!("{current_path}/v1{path}")
+        format!("{current_path}/v1{endpoint_suffix}")
     };
     base.set_path(&joined_path);
     Ok(base.to_string().trim_end_matches('/').to_string())
@@ -701,19 +1125,27 @@ async fn fetch_models_for_probe(
         models_url_override,
     )?;
     let client = http_client::get();
-    let mut last_status = None;
+    let mut last_error = None;
 
     for url in candidates {
         for auth_mode in [AuthMode::Bearer, AuthMode::XApiKey] {
-            let response = client
+            let response = match client
                 .get(&url)
                 .headers(auth_headers(api_key, auth_mode)?)
+                .header(CONNECTION, "close")
                 .timeout(PROBE_TIMEOUT)
                 .send()
                 .await
-                .map_err(|error| format!("Model discovery request failed: {error}"))?;
-            last_status = Some(response.status());
-            if !response.status().is_success() {
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    last_error = Some(format!("Model discovery request failed: {error}"));
+                    continue;
+                }
+            };
+            let status = response.status();
+            if !status.is_success() {
+                last_error = Some(format!("Model discovery failed with HTTP {status}"));
                 continue;
             }
             let body = response
@@ -725,30 +1157,120 @@ async fn fetch_models_for_probe(
             }
             let value: Value = serde_json::from_slice(&body)
                 .map_err(|error| format!("Model discovery response is invalid JSON: {error}"))?;
-            return Ok(value
-                .get("data")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|model| {
-                    Some(DetectedModel {
-                        id: model.get("id")?.as_str()?.to_string(),
-                        owned_by: model
-                            .get("owned_by")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                    })
-                })
-                .collect());
+            match parse_models_response(&value) {
+                Ok(models) => return Ok(models),
+                Err(error) => last_error = Some(error),
+            }
         }
     }
 
-    Err(format!(
-        "Model discovery failed{}",
-        last_status
-            .map(|status| format!(" with HTTP {status}"))
-            .unwrap_or_default()
-    ))
+    Err(last_error.unwrap_or_else(|| "Model discovery failed".to_string()))
+}
+
+fn parse_models_response(value: &Value) -> Result<Vec<DetectedModel>, String> {
+    let mut models = Vec::new();
+    let mut recognized = false;
+
+    if let Some(entries) = value.as_array() {
+        recognized = true;
+        for entry in entries {
+            push_detected_model(&mut models, entry, None);
+        }
+    } else {
+        for key in ["data", "models", "items"] {
+            if let Some(entries) = value.get(key).and_then(Value::as_array) {
+                recognized = true;
+                for entry in entries {
+                    push_detected_model(&mut models, entry, None);
+                }
+                break;
+            }
+        }
+
+        if !recognized {
+            if let Some(data) = value.get("data") {
+                for key in ["models", "items"] {
+                    if let Some(entries) = data.get(key).and_then(Value::as_array) {
+                        recognized = true;
+                        for entry in entries {
+                            push_detected_model(&mut models, entry, None);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        if !recognized {
+            if let Some(model_map) = value.get("models").and_then(Value::as_object) {
+                recognized = true;
+                for (id, entry) in model_map {
+                    push_detected_model(&mut models, entry, Some(id));
+                }
+            }
+        }
+    }
+
+    if !recognized {
+        return Err("Model discovery response does not contain data, models, or items".to_string());
+    }
+
+    let mut seen = HashSet::new();
+    models.retain(|model| seen.insert(model.id.clone()));
+    if models.len() > MAX_DISCOVERED_MODELS {
+        return Err(format!(
+            "Model discovery returned more than {MAX_DISCOVERED_MODELS} models"
+        ));
+    }
+    Ok(models)
+}
+
+fn push_detected_model(models: &mut Vec<DetectedModel>, entry: &Value, fallback_id: Option<&str>) {
+    if let Some(id) = entry.as_str().map(str::trim).filter(|id| !id.is_empty()) {
+        models.push(DetectedModel {
+            id: id.to_string(),
+            owned_by: None,
+            display_name: None,
+        });
+        return;
+    }
+
+    let Some(object) = entry.as_object() else {
+        if let Some(id) = fallback_id.map(str::trim).filter(|id| !id.is_empty()) {
+            models.push(DetectedModel {
+                id: id.to_string(),
+                owned_by: None,
+                display_name: None,
+            });
+        }
+        return;
+    };
+    let Some(id) = model_string_field(object, &["id", "model", "slug", "name"]).or_else(|| {
+        fallback_id
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+    }) else {
+        return;
+    };
+
+    models.push(DetectedModel {
+        id,
+        owned_by: model_string_field(
+            object,
+            &["owned_by", "ownedBy", "owner", "provider", "vendor"],
+        ),
+        display_name: model_string_field(object, &["display_name", "displayName", "name"]),
+    });
+}
+
+fn model_string_field(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .filter_map(|key| object.get(*key))
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 async fn probe_endpoint(
@@ -791,6 +1313,7 @@ async fn probe_endpoint(
                 }
             })
             .header("content-type", "application/json")
+            .header(CONNECTION, "close")
             .json(&body)
             .timeout(PROBE_TIMEOUT);
 
@@ -947,12 +1470,52 @@ mod tests {
     #[test]
     fn appends_v1_without_duplicating_it() {
         assert_eq!(
-            endpoint_url("https://api.example", UrlMode::Base, "/responses").unwrap(),
+            endpoint_url("https://api.example", UrlMode::Base, "/v1/responses").unwrap(),
             "https://api.example/v1/responses"
         );
         assert_eq!(
-            endpoint_url("https://api.example/v1", UrlMode::Base, "/responses").unwrap(),
+            endpoint_url("https://api.example/v1", UrlMode::Base, "/v1/responses").unwrap(),
             "https://api.example/v1/responses"
+        );
+        assert_eq!(
+            endpoint_url(
+                "https://api.example/v4",
+                UrlMode::Base,
+                "/v1/chat/completions"
+            )
+            .unwrap(),
+            "https://api.example/v4/chat/completions"
+        );
+        assert_eq!(
+            endpoint_url("https://api.example/gateway", UrlMode::Base, "/v1/messages").unwrap(),
+            "https://api.example/gateway/v1/messages"
+        );
+    }
+
+    #[test]
+    fn parses_common_model_shapes_with_display_names() {
+        let models = parse_models_response(&json!({
+            "models": [
+                {"slug": "claude-opus-5-thinking", "display_name": "Claude Opus 5", "vendor": "Anthropic"},
+                "gpt-5.6-sol"
+            ]
+        }))
+        .expect("parse models shape");
+
+        assert_eq!(
+            models,
+            vec![
+                DetectedModel {
+                    id: "claude-opus-5-thinking".to_string(),
+                    owned_by: Some("Anthropic".to_string()),
+                    display_name: Some("Claude Opus 5".to_string()),
+                },
+                DetectedModel {
+                    id: "gpt-5.6-sol".to_string(),
+                    owned_by: None,
+                    display_name: None,
+                }
+            ]
         );
     }
 
@@ -964,8 +1527,15 @@ mod tests {
             }))
         }
 
-        async fn inference() -> Json<Value> {
-            Json(json!({"id": "probe-response"}))
+        async fn inference(Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
+            if body.get("model").and_then(Value::as_str) == Some("test-model") {
+                (StatusCode::OK, Json(json!({"id": "probe-response"})))
+            } else {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": {"code": "model_not_found"}})),
+                )
+            }
         }
 
         let app = Router::new()
@@ -988,7 +1558,7 @@ mod tests {
         });
 
         let result = probe_provider_capabilities(ProviderProbeInput {
-            base_url: format!("http://{address}/v1"),
+            base_url: format!("http://{address}"),
             api_key: "secret-probe-key".to_string(),
             models_url: None,
             model: None,
@@ -1021,6 +1591,25 @@ mod tests {
             .expect("serialize result")
             .contains("secret-probe-key"));
 
+        let repeated = probe_provider_capabilities(ProviderProbeInput {
+            base_url: format!("http://{address}"),
+            api_key: "secret-probe-key".to_string(),
+            models_url: None,
+            model: Some("stale-model-from-previous-provider".to_string()),
+            allow_inference_probe: true,
+        })
+        .await
+        .expect("repeat probe with stale model");
+        assert_eq!(repeated.recommended_model.as_deref(), Some("test-model"));
+        assert!(repeated
+            .capabilities
+            .iter()
+            .all(|capability| capability.supported));
+        assert!(repeated
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("not in this provider catalog")));
+
         let _ = shutdown_tx.send(());
         server.await.expect("join probe server");
     }
@@ -1032,8 +1621,22 @@ mod tests {
             base_url: "https://gateway.example/v1".to_string(),
             api_key: "sk-secret-value-1234".to_string(),
             model: "provider-model".to_string(),
+            models: vec![
+                DetectedModel {
+                    id: "provider-model".to_string(),
+                    owned_by: Some("Example".to_string()),
+                    display_name: Some("Provider Model".to_string()),
+                },
+                DetectedModel {
+                    id: "provider-model-fast".to_string(),
+                    owned_by: Some("Example".to_string()),
+                    display_name: Some("Provider Model Fast".to_string()),
+                },
+            ],
             claude_protocol: Some(UpstreamProtocol::OpenAiChat),
             codex_protocol: Some(UpstreamProtocol::OpenAiResponses),
+            claude_desktop_protocol: None,
+            opencode_protocol: None,
         })
         .expect("build preview");
 
@@ -1042,6 +1645,19 @@ mod tests {
         assert!(preview.proxy_will_start);
         assert_eq!(preview.claude.as_ref().unwrap().mode, "proxy");
         assert_eq!(preview.codex.as_ref().unwrap().mode, "direct");
+        assert!(!preview
+            .codex
+            .as_ref()
+            .unwrap()
+            .redacted_config
+            .to_string()
+            .contains("requires_openai_auth"));
+        assert_eq!(
+            preview.codex.as_ref().unwrap().redacted_config["modelCatalog"]["models"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
         assert!(preview
             .claude
             .as_ref()
@@ -1049,6 +1665,94 @@ mod tests {
             .redacted_config
             .to_string()
             .contains("sk-...1234"));
+    }
+
+    #[test]
+    fn cowork_proxy_catalog_routes_every_discovered_model_to_its_upstream_id() {
+        let selection = ProviderInstallSelection {
+            name: "Gateway".to_string(),
+            base_url: "https://gateway.example/v1".to_string(),
+            api_key: "secret".to_string(),
+            model: "third-party-model".to_string(),
+            models: vec![
+                DetectedModel {
+                    id: "third-party-model".to_string(),
+                    owned_by: None,
+                    display_name: Some("Third Party Model".to_string()),
+                },
+                DetectedModel {
+                    id: "claude-opus-5".to_string(),
+                    owned_by: None,
+                    display_name: Some("Claude Opus 5".to_string()),
+                },
+            ],
+            claude_protocol: None,
+            codex_protocol: None,
+            claude_desktop_protocol: Some(UpstreamProtocol::OpenAiChat),
+            opencode_protocol: None,
+        };
+        let provider = build_provider_for_app(
+            &selection,
+            "wizard-gateway",
+            AppType::ClaudeDesktop,
+            UpstreamProtocol::OpenAiChat,
+        )
+        .expect("build Cowork provider");
+        let meta = provider.meta.expect("Cowork metadata");
+        assert_eq!(meta.claude_desktop_mode, Some(ClaudeDesktopMode::Proxy));
+        assert_eq!(meta.claude_desktop_model_routes.len(), 2);
+        assert!(meta
+            .claude_desktop_model_routes
+            .values()
+            .any(|route| route.model == "third-party-model"));
+        assert!(meta
+            .claude_desktop_model_routes
+            .values()
+            .any(|route| route.model == "claude-opus-5"));
+    }
+
+    #[test]
+    fn opencode_provider_keeps_the_full_discovered_model_map() {
+        let selection = ProviderInstallSelection {
+            name: "Gateway".to_string(),
+            base_url: "https://gateway.example/v1".to_string(),
+            api_key: "secret".to_string(),
+            model: "model-fast".to_string(),
+            models: vec![
+                DetectedModel {
+                    id: "model-fast".to_string(),
+                    owned_by: None,
+                    display_name: Some("Model Fast".to_string()),
+                },
+                DetectedModel {
+                    id: "model-reasoning".to_string(),
+                    owned_by: None,
+                    display_name: Some("Model Reasoning".to_string()),
+                },
+            ],
+            claude_protocol: None,
+            codex_protocol: None,
+            claude_desktop_protocol: None,
+            opencode_protocol: Some(UpstreamProtocol::OpenAiChat),
+        };
+        let provider = build_provider_for_app(
+            &selection,
+            "wizard-gateway",
+            AppType::OpenCode,
+            UpstreamProtocol::OpenAiChat,
+        )
+        .expect("build OpenCode provider");
+        assert_eq!(provider.settings_config["npm"], "@ai-sdk/openai-compatible");
+        assert_eq!(
+            provider.settings_config["models"]
+                .as_object()
+                .map(|map| map.len()),
+            Some(2)
+        );
+        assert_eq!(
+            provider.settings_config["models"]["model-fast"]["name"],
+            "Model Fast (model-fast)"
+        );
     }
 
     #[tokio::test]
@@ -1062,8 +1766,22 @@ mod tests {
             base_url: "https://gateway.example/v1".to_string(),
             api_key: "sk-secret-value-1234".to_string(),
             model: "provider-model".to_string(),
+            models: vec![
+                DetectedModel {
+                    id: "provider-model".to_string(),
+                    owned_by: Some("Example".to_string()),
+                    display_name: Some("Provider Model".to_string()),
+                },
+                DetectedModel {
+                    id: "provider-model-fast".to_string(),
+                    owned_by: Some("Example".to_string()),
+                    display_name: Some("Provider Model Fast".to_string()),
+                },
+            ],
             claude_protocol: Some(UpstreamProtocol::AnthropicMessages),
             codex_protocol: Some(UpstreamProtocol::OpenAiResponses),
+            claude_desktop_protocol: None,
+            opencode_protocol: None,
         };
 
         let result = apply_provider_install(&state, selection)
@@ -1077,10 +1795,29 @@ mod tests {
             .get_provider_by_id(&provider_id, "claude")
             .expect("read Claude provider")
             .is_some());
-        assert!(db
+        let codex_provider = db
             .get_provider_by_id(&provider_id, "codex")
             .expect("read Codex provider")
-            .is_some());
+            .expect("Codex provider exists");
+        let catalog_models = codex_provider.settings_config["modelCatalog"]["models"]
+            .as_array()
+            .expect("wizard Codex model catalog");
+        assert_eq!(catalog_models.len(), 2);
+        assert_eq!(catalog_models[0]["model"], "provider-model");
+        assert_eq!(
+            catalog_models[0]["displayName"],
+            "Provider Model (provider-model)"
+        );
+        assert_eq!(catalog_models[1]["model"], "provider-model-fast");
+        let live_config = crate::codex_config::read_and_validate_codex_config_text()
+            .expect("read generated Codex config");
+        assert!(live_config.contains("model_catalog_json"));
+        let live_catalog: Value =
+            crate::config::read_json_file(&crate::codex_config::get_codex_model_catalog_path())
+                .expect("read generated Codex model catalog");
+        assert_eq!(live_catalog["models"].as_array().map(Vec::len), Some(2));
+        assert_eq!(live_catalog["models"][0]["slug"], "provider-model");
+        assert_eq!(live_catalog["models"][1]["slug"], "provider-model-fast");
         assert_eq!(
             crate::settings::get_effective_current_provider(&db, &AppType::Claude)
                 .expect("Claude current"),

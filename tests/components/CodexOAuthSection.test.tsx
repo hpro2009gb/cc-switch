@@ -1,4 +1,5 @@
 import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { CodexOAuthSection } from "@/components/providers/forms/CodexOAuthSection";
 import { AuthCenterPanel } from "@/components/settings/AuthCenterPanel";
@@ -28,7 +29,10 @@ vi.mock("@/components/providers/forms/XaiOAuthSection", () => ({
 }));
 
 describe("CodexOAuthSection", () => {
+  let importChromeCookies: ReturnType<typeof vi.fn>;
+
   beforeEach(() => {
+    importChromeCookies = vi.fn();
     mocks.useCodexOauth.mockReturnValue({
       accounts: [
         {
@@ -48,9 +52,11 @@ describe("CodexOAuthSection", () => {
       error: null,
       isPolling: false,
       isAddingAccount: false,
+      isImportingChromeCookies: false,
       isRemovingAccount: false,
       isSettingDefaultAccount: false,
       addAccount: vi.fn(),
+      importChromeCookies,
       removeAccount: vi.fn(),
       setDefaultAccount: vi.fn(),
       cancelAuth: vi.fn(),
@@ -70,5 +76,24 @@ describe("CodexOAuthSection", () => {
 
     expect(mocks.renderAccountQuota).toHaveBeenCalledWith("account-1");
     expect(screen.getByTestId("account-quota")).toHaveTextContent("account-1");
+  });
+
+  it("imports a ChatGPT account from Chrome", async () => {
+    const user = userEvent.setup();
+
+    render(<CodexOAuthSection />);
+
+    await user.type(
+      screen.getByRole("textbox"),
+      "__Secure-next-auth.session-token.0=session-part",
+    );
+    await user.click(
+      screen.getByRole("button", { name: "导入 Chrome Cookie" }),
+    );
+
+    expect(importChromeCookies).toHaveBeenCalledTimes(1);
+    expect(importChromeCookies).toHaveBeenCalledWith(
+      "__Secure-next-auth.session-token.0=session-part",
+    );
   });
 });

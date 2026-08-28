@@ -9,6 +9,8 @@
     "tauri": "tauri",
     "dev:renderer": "vite",
     "build:renderer": "vite build",
+    "build:personal:renderer": "vite build --mode personal",
+    "build:personal": "pnpm tauri build --config src-tauri/tauri.personal.conf.json --bundles msi --target x86_64-pc-windows-msvc --features personal",
     "typecheck": "tsc --noEmit",
     "format": "prettier --write \"src/**/*.{js,jsx,ts,tsx,css,json}\"",
     "format:check": "prettier --check \"src/**/*.{js,jsx,ts,tsx,css,json}\"",

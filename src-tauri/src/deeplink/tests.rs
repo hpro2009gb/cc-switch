@@ -79,6 +79,15 @@ fn test_parse_valid_claude_deeplink() {
 }
 
 #[test]
+fn test_parse_personal_deeplink() {
+    let url = "ccswitch-personal://v1/import?resource=provider&app=claude&name=Personal";
+
+    let request = parse_deeplink_url(url).unwrap();
+
+    assert_eq!(request.name.as_deref(), Some("Personal"));
+}
+
+#[test]
 fn test_parse_deeplink_with_notes() {
     let url = "ccswitch://v1/import?resource=provider&app=codex&name=Codex&homepage=https%3A%2F%2Fcodex.com&endpoint=https%3A%2F%2Fapi.codex.com&apiKey=key123&notes=Test%20notes";
 

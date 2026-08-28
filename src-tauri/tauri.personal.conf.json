@@ -1,0 +1,18 @@
+{
+  "productName": "CC Switch Personal",
+  "identifier": "com.ccswitch.personal",
+  "build": {
+    "beforeBuildCommand": "pnpm run build:personal:renderer"
+  },
+  "bundle": {
+    "targets": ["msi"],
+    "createUpdaterArtifacts": false
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["ccswitch-personal"]
+      }
+    }
+  }
+}

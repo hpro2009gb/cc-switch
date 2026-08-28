@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
 import { Switch } from "@/components/ui/switch";
 import {
   Select,
@@ -21,6 +22,7 @@ import {
   X,
   Sparkles,
   User,
+  Download,
 } from "lucide-react";
 import { useCodexOauth } from "./hooks/useCodexOauth";
 import { copyText } from "@/lib/clipboard";
@@ -56,6 +58,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
 }) => {
   const { t } = useTranslation();
   const [copied, setCopied] = React.useState(false);
+  const [chromeCookie, setChromeCookie] = React.useState("");
 
   const {
     accounts,
@@ -68,7 +71,9 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
     isAddingAccount,
     isRemovingAccount,
     isSettingDefaultAccount,
+    isImportingChromeCookies,
     addAccount,
+    importChromeCookies,
     removeAccount,
     setDefaultAccount,
     cancelAuth,
@@ -234,32 +239,88 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
         </div>
       )}
 
+      <div className="space-y-2 rounded-md border bg-muted/20 p-3">
+        <Label className="text-sm text-muted-foreground">
+          {t("codexOauth.chromeCookieLabel", "从 Chrome DevTools 导入")}
+        </Label>
+        <Textarea
+          value={chromeCookie}
+          onChange={(event) => setChromeCookie(event.target.value)}
+          placeholder={t(
+            "codexOauth.chromeCookiePlaceholder",
+            "粘贴 Cookie: name=value 或 __Secure-next-auth.session-token.0=value",
+          )}
+          rows={3}
+          autoComplete="off"
+        />
+        <p className="text-xs text-muted-foreground">
+          {t(
+            "codexOauth.chromeCookieHint",
+            "在 chatgpt.com 的 DevTools → Application → Cookies 中复制 __Secure-next-auth.session-token.0/.1；每个 Chrome 账号分别导入一次。",
+          )}
+        </p>
+      </div>
+
       {/* 未认证 - 登录按钮 */}
-      {!hasAnyAccount && pollingState === "idle" && (
-        <Button
-          type="button"
-          onClick={addAccount}
-          className="w-full"
-          variant="outline"
-        >
-          <Sparkles className="mr-2 h-4 w-4" />
-          {t("codexOauth.loginWithChatGPT", "使用 ChatGPT 登录")}
-        </Button>
-      )}
+      {!hasAnyAccount &&
+        (pollingState === "idle" || pollingState === "error") && (
+          <div className="flex gap-2">
+            <Button
+              type="button"
+              onClick={addAccount}
+              className="flex-1"
+              variant="outline"
+            >
+              <Sparkles className="mr-2 h-4 w-4" />
+              {t("codexOauth.loginWithChatGPT", "使用 ChatGPT 登录")}
+            </Button>
+            <Button
+              type="button"
+              onClick={() => importChromeCookies(chromeCookie)}
+              className="flex-1"
+              variant="secondary"
+              disabled={isImportingChromeCookies}
+            >
+              {isImportingChromeCookies ? (
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              ) : (
+                <Download className="mr-2 h-4 w-4" />
+              )}
+              {t("codexOauth.importFromChrome", "导入 Chrome Cookie")}
+            </Button>
+          </div>
+        )}
 
       {/* 已有账号 - 添加更多按钮 */}
-      {hasAnyAccount && pollingState === "idle" && (
-        <Button
-          type="button"
-          onClick={addAccount}
-          className="w-full"
-          variant="outline"
-          disabled={isAddingAccount}
-        >
-          <Plus className="mr-2 h-4 w-4" />
-          {t("codexOauth.addAnotherAccount", "添加其他账号")}
-        </Button>
-      )}
+      {hasAnyAccount &&
+        (pollingState === "idle" || pollingState === "error") && (
+          <div className="flex gap-2">
+            <Button
+              type="button"
+              onClick={addAccount}
+              className="flex-1"
+              variant="outline"
+              disabled={isAddingAccount}
+            >
+              <Plus className="mr-2 h-4 w-4" />
+              {t("codexOauth.addAnotherAccount", "添加其他账号")}
+            </Button>
+            <Button
+              type="button"
+              onClick={() => importChromeCookies(chromeCookie)}
+              className="flex-1"
+              variant="secondary"
+              disabled={isImportingChromeCookies}
+            >
+              {isImportingChromeCookies ? (
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              ) : (
+                <Download className="mr-2 h-4 w-4" />
+              )}
+              {t("codexOauth.importFromChrome", "导入 Chrome Cookie")}
+            </Button>
+          </div>
+        )}
 
       {/* 轮询中状态 */}
       {isPolling && deviceCode && (

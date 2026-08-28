@@ -9,6 +9,8 @@ use std::sync::{Mutex, OnceLock};
 
 const STANDARD_OMO_PLUGIN_PREFIXES: [&str; 2] = ["oh-my-openagent", "oh-my-opencode"];
 const SLIM_OMO_PLUGIN_PREFIXES: [&str; 1] = ["oh-my-opencode-slim"];
+pub const MANAGED_GATEWAY_PROVIDER_ID: &str = "cc-switch";
+const MANAGED_GATEWAY_PROVIDER_NAME: &str = "CC Switch local gateway";
 fn opencode_config_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -176,6 +178,62 @@ pub fn set_provider(id: &str, config: Value) -> Result<(), AppError> {
         providers.insert(id.to_string(), config);
     }
 
+    write_opencode_config_to_path_with_contents(&path, &full_config).map(|_| ())
+}
+
+fn is_managed_gateway_provider(config: &Value) -> bool {
+    config.get("name").and_then(Value::as_str) == Some(MANAGED_GATEWAY_PROVIDER_NAME)
+        && config
+            .get("options")
+            .and_then(|options| options.get("baseURL"))
+            .and_then(Value::as_str)
+            .is_some_and(|url| url.trim_end_matches('/').ends_with("/opencode/v1"))
+}
+
+pub fn set_managed_gateway_provider(config: Value) -> Result<(), AppError> {
+    let _guard = opencode_config_lock().lock()?;
+    let path = get_opencode_config_path();
+    let mut full_config = read_opencode_config_from_path(&path)?;
+    if !full_config.get("provider").is_some_and(Value::is_object) {
+        full_config["provider"] = json!({});
+    }
+    let providers = full_config["provider"].as_object_mut().ok_or_else(|| {
+        AppError::Config("OpenCode provider config must be an object".to_string())
+    })?;
+    if providers
+        .get(MANAGED_GATEWAY_PROVIDER_ID)
+        .is_some_and(|existing| !is_managed_gateway_provider(existing))
+    {
+        return Err(AppError::Config(format!(
+            "OpenCode provider '{}' already exists and is not managed by CC Switch",
+            MANAGED_GATEWAY_PROVIDER_ID
+        )));
+    }
+    providers.insert(MANAGED_GATEWAY_PROVIDER_ID.to_string(), config);
+    write_opencode_config_to_path_with_contents(&path, &full_config).map(|_| ())
+}
+
+pub fn remove_managed_gateway_provider() -> Result<(), AppError> {
+    let _guard = opencode_config_lock().lock()?;
+    let path = get_opencode_config_path();
+    let mut full_config = read_opencode_config_from_path(&path)?;
+    let Some(providers) = full_config
+        .get_mut("provider")
+        .and_then(Value::as_object_mut)
+    else {
+        return Ok(());
+    };
+    match providers.get(MANAGED_GATEWAY_PROVIDER_ID) {
+        None => return Ok(()),
+        Some(existing) if is_managed_gateway_provider(existing) => {}
+        Some(_) => {
+            return Err(AppError::Config(format!(
+                "OpenCode provider '{}' changed outside CC Switch; refusing to remove it",
+                MANAGED_GATEWAY_PROVIDER_ID
+            )))
+        }
+    }
+    providers.remove(MANAGED_GATEWAY_PROVIDER_ID);
     write_opencode_config_to_path_with_contents(&path, &full_config).map(|_| ())
 }
 
@@ -419,6 +477,62 @@ mod tests {
         assert_eq!(
             config["model"], "keep-me",
             "unrelated user config must be preserved"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn managed_gateway_preserves_user_config_and_only_removes_its_own_entry() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _guard = TestHomeGuard::set(temp.path());
+        write_config(
+            temp.path(),
+            r#"{"theme":"dark","provider":{"user":{"npm":"custom"}}}"#,
+        );
+        let managed = json!({
+            "npm": "@ai-sdk/openai",
+            "name": "CC Switch local gateway",
+            "options": {"baseURL": "http://127.0.0.1:15721/opencode/v1"},
+            "models": {"model-a": {"name": "Model A"}}
+        });
+
+        set_managed_gateway_provider(managed).expect("add managed provider");
+        let configured = read_opencode_config().expect("read configured file");
+        assert_eq!(configured["theme"], "dark");
+        assert_eq!(configured["provider"]["user"]["npm"], "custom");
+        assert_eq!(
+            configured["provider"][MANAGED_GATEWAY_PROVIDER_ID]["models"]["model-a"]["name"],
+            "Model A"
+        );
+
+        remove_managed_gateway_provider().expect("remove managed provider");
+        let restored = read_opencode_config().expect("read restored file");
+        assert_eq!(restored["theme"], "dark");
+        assert_eq!(restored["provider"]["user"]["npm"], "custom");
+        assert!(restored["provider"]
+            .get(MANAGED_GATEWAY_PROVIDER_ID)
+            .is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn managed_gateway_refuses_to_overwrite_a_user_provider_with_the_reserved_id() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _guard = TestHomeGuard::set(temp.path());
+        write_config(
+            temp.path(),
+            r#"{"provider":{"cc-switch":{"npm":"user-owned"}}}"#,
+        );
+
+        let result = set_managed_gateway_provider(json!({
+            "name": "CC Switch local gateway",
+            "options": {"baseURL": "http://127.0.0.1:15721/opencode/v1"}
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(
+            read_opencode_config().expect("read unchanged file")["provider"]["cc-switch"]["npm"],
+            "user-owned"
         );
     }
 

@@ -131,7 +131,7 @@ impl RequestContext {
 
         // 使用共享的 ProviderRouter 选择 Provider（熔断器状态跨请求保持）
         // 注意：只在这里调用一次，结果传递给 forwarder，避免重复消耗 HalfOpen 名额
-        let providers = state
+        let mut providers = state
             .provider_router
             .select_providers(app_type_str)
             .await
@@ -142,6 +142,24 @@ impl RequestContext {
                 crate::error::AppError::NoProvidersConfigured => ProxyError::NoProvidersConfigured,
                 _ => ProxyError::DatabaseError(e.to_string()),
             })?;
+
+        // OpenCode's managed gateway must never substitute its target's default
+        // model during failover. A target that does not advertise the requested
+        // model is skipped, so the caller gets a clear unavailable-provider error.
+        if app_type == AppType::OpenCode {
+            providers.retain(|provider| {
+                provider
+                    .settings_config
+                    .get("models")
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(|models| models.contains_key(&request_model))
+            });
+        } else if app_type == AppType::ClaudeDesktop {
+            providers.retain(|provider| {
+                crate::claude_desktop_config::map_proxy_request_model(body.clone(), provider)
+                    .is_ok()
+            });
+        }
 
         let provider = providers
             .first()

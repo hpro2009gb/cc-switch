@@ -356,7 +356,10 @@ export function AddProviderDialog({
   const footer =
     !showUniversalTab || activeTab === "app-specific" ? (
       <>
-        {(appId === "claude" || appId === "codex") && (
+        {(appId === "claude" ||
+          appId === "codex" ||
+          appId === "claude-desktop" ||
+          appId === "opencode") && (
           <Button variant="ghost" onClick={openSetupWizard} className="mr-auto">
             <WandSparkles className="mr-2 h-4 w-4" />
             Thiết lập nhanh

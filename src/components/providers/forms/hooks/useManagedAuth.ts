@@ -131,6 +131,22 @@ export function useManagedAuth(
     },
   });
 
+  const importChromeMutation = useMutation({
+    mutationFn: (cookieHeader: string) =>
+      authApi.authImportChromeCookies(authProvider, cookieHeader),
+    onSuccess: async () => {
+      setPollingState("idle");
+      setDeviceCode(null);
+      setError(null);
+      await refetchStatus();
+      await queryClient.invalidateQueries({ queryKey });
+    },
+    onError: (e) => {
+      setPollingState("error");
+      setError(e instanceof Error ? e.message : String(e));
+    },
+  });
+
   const logoutMutation = useMutation({
     mutationFn: () => authApi.authLogout(authProvider),
     onSuccess: async () => {
@@ -196,6 +212,22 @@ export function useManagedAuth(
     setError(null);
   }, [stopPolling]);
 
+  const importChromeCookies = useCallback(
+    (cookieHeader: string) => {
+      if (!cookieHeader.trim()) {
+        setError("Paste the ChatGPT cookie copied from Chrome DevTools first.");
+        setPollingState("error");
+        return;
+      }
+      setPollingState("idle");
+      setDeviceCode(null);
+      setError(null);
+      stopPolling();
+      importChromeMutation.mutate(cookieHeader);
+    },
+    [importChromeMutation, stopPolling],
+  );
+
   const logout = useCallback(() => {
     logoutMutation.mutate();
   }, [logoutMutation]);
@@ -229,10 +261,12 @@ export function useManagedAuth(
     error,
     isPolling: pollingState === "polling",
     isAddingAccount: startLoginMutation.isPending || pollingState === "polling",
+    isImportingChromeCookies: importChromeMutation.isPending,
     isRemovingAccount: removeAccountMutation.isPending,
     isSettingDefaultAccount: setDefaultAccountMutation.isPending,
     startAuth,
     addAccount: startAuth,
+    importChromeCookies,
     cancelAuth,
     logout,
     removeAccount,

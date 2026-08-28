@@ -5,6 +5,7 @@ release/
 *.log
 .env
 .env.local
+.env.personal
 *.tsbuildinfo
 .npmrc
 CLAUDE.md
@@ -30,3 +31,10 @@ copilot-api
 CODEBUDDY.md
 mainWindow.js
 .slim/deepwork/
+.cc-switch-personal
+publicrepo/
+.reuseforge/
+PLAN.md
+TODO.md
+tmp-*.ps1
+tmp-*.js

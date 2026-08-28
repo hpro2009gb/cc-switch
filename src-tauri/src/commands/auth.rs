@@ -303,6 +303,33 @@ pub async fn auth_get_status(
 }
 
 #[tauri::command(rename_all = "camelCase")]
+pub async fn auth_import_chrome_cookies(
+    auth_provider: String,
+    cookie_header: String,
+    codex_state: State<'_, CodexOAuthState>,
+) -> Result<ManagedAuthAccount, String> {
+    let auth_provider = ensure_auth_provider(&auth_provider)?;
+    if auth_provider != AUTH_PROVIDER_CODEX_OAUTH {
+        return Err("Chrome cookie import is currently available for Codex OAuth only".to_string());
+    }
+
+    let session = crate::services::codex_chrome_import::import_from_cookie(&cookie_header).await?;
+    let auth_manager = codex_state.0.write().await;
+    let default_account_id = auth_manager.get_status().await.default_account_id;
+
+    let account = auth_manager
+        .import_browser_session(session)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(map_account(
+        auth_provider,
+        account,
+        default_account_id.as_deref(),
+    ))
+}
+
+#[tauri::command(rename_all = "camelCase")]
 pub async fn auth_remove_account(
     auth_provider: String,
     account_id: String,

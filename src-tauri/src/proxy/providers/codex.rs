@@ -630,6 +630,18 @@ impl CodexAdapter {
             return Some(key.to_string());
         }
 
+        // OpenCode stores credentials in the AI SDK options object.
+        if let Some(key) = provider
+            .settings_config
+            .get("options")
+            .and_then(|options| options.get("apiKey"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+        {
+            return Some(key.to_string());
+        }
+
         // 4. 尝试从 config 对象中获取
         if let Some(config) = provider.settings_config.get("config") {
             if let Some(key) = config
@@ -685,6 +697,15 @@ impl ProviderAdapter for CodexAdapter {
             .settings_config
             .get("base_url")
             .and_then(|v| v.as_str())
+        {
+            return Ok(url.trim_end_matches('/').to_string());
+        }
+
+        if let Some(url) = provider
+            .settings_config
+            .get("options")
+            .and_then(|options| options.get("baseURL"))
+            .and_then(|value| value.as_str())
         {
             return Ok(url.trim_end_matches('/').to_string());
         }
@@ -1431,6 +1452,43 @@ wire_api = "responses"
 
         assert_eq!(upstream_model.as_deref(), Some("kimi-k2"));
         assert_eq!(body.get("model").and_then(|v| v.as_str()), Some("kimi-k2"));
+    }
+
+    #[test]
+    fn test_apply_codex_chat_upstream_model_does_not_map_picker_model_to_default() {
+        let mut provider = create_provider(json!({
+            "config": r#"
+model_provider = "wizard"
+model = "claude-opus-5-thinking"
+
+[model_providers.wizard]
+name = "Wizard"
+base_url = "https://gateway.example/v1"
+wire_api = "responses"
+"#,
+            "modelCatalog": {
+                "models": [
+                    { "model": "claude-opus-5-thinking" },
+                    { "model": "gpt-5.6-sol" }
+                ]
+            }
+        }));
+        provider.meta = Some(crate::provider::ProviderMeta {
+            api_format: Some("openai_chat".to_string()),
+            ..Default::default()
+        });
+        let mut body = json!({
+            "model": "gpt-5.6-sol",
+            "input": "ping"
+        });
+
+        let upstream_model = apply_codex_chat_upstream_model(&provider, &mut body);
+
+        assert_eq!(upstream_model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(
+            body.get("model").and_then(|v| v.as_str()),
+            Some("gpt-5.6-sol")
+        );
     }
 
     #[test]

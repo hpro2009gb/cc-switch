@@ -463,7 +463,7 @@ fn map_reasoning_effort(effort: &str, mode: Option<&str>) -> Option<&'static str
 
     match mode.unwrap_or("passthrough") {
         "deepseek" => match effort.as_str() {
-            "max" | "xhigh" => Some("max"),
+            "ultra" | "max" | "xhigh" => Some("max"),
             _ => Some("high"),
         },
         "low_high" => match effort.as_str() {
@@ -475,7 +475,7 @@ fn map_reasoning_effort(effort: &str, mode: Option<&str>) -> Option<&'static str
         // `400 reasoning_effort: Invalid option`（见 openclaw#77350）；钳到最高合法档
         // xhigh，其余合法值透传，未知值丢弃以免被上游拒绝。
         "openrouter" => match effort.as_str() {
-            "max" | "xhigh" => Some("xhigh"),
+            "ultra" | "max" | "xhigh" => Some("xhigh"),
             "high" => Some("high"),
             "medium" => Some("medium"),
             "low" => Some("low"),
@@ -489,6 +489,7 @@ fn map_reasoning_effort(effort: &str, mode: Option<&str>) -> Option<&'static str
             "high" => Some("high"),
             "xhigh" => Some("xhigh"),
             "max" => Some("max"),
+            "ultra" => Some("ultra"),
             _ => None,
         },
     }
@@ -2497,7 +2498,7 @@ mod tests {
         let input = json!({
             "model": "deepseek-v4-pro",
             "input": "hello",
-            "reasoning": {"effort": "xhigh"}
+            "reasoning": {"effort": "ultra"}
         });
         let config = CodexChatReasoningConfig {
             supports_thinking: Some(true),
@@ -2527,12 +2528,12 @@ mod tests {
             output_format: Some("auto".to_string()),
         };
 
-        // max 不在 OpenRouter 枚举内（见 openclaw#77350），必须钳成 xhigh，
+        // Ultra/max 不在 OpenRouter 枚举内，必须钳成 xhigh，
         // 且写进原生 reasoning 对象，而非顶层 reasoning_effort 别名。
         let input = json!({
             "model": "deepseek/deepseek-chat-v3.1",
             "input": "hello",
-            "reasoning": {"effort": "max"}
+            "reasoning": {"effort": "ultra"}
         });
         let result = responses_to_chat_completions_with_reasoning(input, Some(&config)).unwrap();
 
